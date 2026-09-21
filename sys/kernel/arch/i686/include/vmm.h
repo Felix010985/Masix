@@ -43,6 +43,9 @@ int vmm_userspace_destroy(uint32_t cr3);
 /* Переключает процессор на текущую активную директорию страниц пользователя */
 void vmm_user_switch(void);
 
+/* Switch to an already-owned address space. */
+void vmm_switch_cr3(uint32_t cr3);
+
 /* Возвращает физический адрес текущего каталога страниц процесса (для загрузки в CR3) */
 uint32_t vmm_user_cr3(void);
 

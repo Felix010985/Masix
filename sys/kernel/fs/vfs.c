@@ -20,6 +20,7 @@ file_t fd_table[32];
 
 extern int fs_create(const char* name);
 extern int fs_read(int file_index, unsigned char* buffer, unsigned int size);
+extern int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsigned int size);
 extern int fs_write(int file_index, const unsigned char* data, unsigned int size);
 typedef struct { char name[32]; unsigned int size; int used; } FileEntry;
 extern FileEntry file_table[];
@@ -174,8 +175,7 @@ static int32_t inet_send(inet_socket_t *source, const uint8_t *buffer, uint32_t 
 }
 
 static int32_t ramfs_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
-    (void)offset;
-    return fs_read(node->internal_id, buffer, size);
+    return fs_read_at(node->internal_id, offset, buffer, size);
 }
 
 static int32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size, const uint8_t *buffer) {

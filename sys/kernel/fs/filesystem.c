@@ -90,15 +90,28 @@ int fs_write(int file_index, const unsigned char* data, unsigned int size) {
     return written;
 }
 
-int fs_read(int file_index, unsigned char* buffer, unsigned int size) {
+int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsigned int size) {
     FileEntry* f = &file_table[file_index];
+    if (offset >= f->size) return 0;
+    if (size > f->size - offset) size = f->size - offset;
+
     unsigned int read = 0;
-    for (int i = 0; i < MAX_BLOCKS_PER_FILE && read < size; i++) {
-        if (f->blocks[i] == -1) break;
-        unsigned int to_read = (size - read) < BLOCK_SIZE ? (size - read) : BLOCK_SIZE;
-        for (unsigned int j = 0; j < to_read; j++)
-            buffer[read + j] = disk[f->blocks[i] * BLOCK_SIZE + j];
+    while (read < size) {
+        unsigned int position = offset + read;
+        unsigned int block = position / BLOCK_SIZE;
+        unsigned int block_offset = position % BLOCK_SIZE;
+        if (block >= MAX_BLOCKS_PER_FILE || f->blocks[block] == -1) break;
+
+        unsigned int available = BLOCK_SIZE - block_offset;
+        unsigned int to_read = (size - read) < available ? (size - read) : available;
+        for (unsigned int j = 0; j < to_read; j++) {
+            buffer[read + j] = disk[f->blocks[block] * BLOCK_SIZE + block_offset + j];
+        }
         read += to_read;
     }
     return read;
+}
+
+int fs_read(int file_index, unsigned char* buffer, unsigned int size) {
+    return fs_read_at(file_index, 0, buffer, size);
 }

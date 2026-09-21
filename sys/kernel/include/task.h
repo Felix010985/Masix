@@ -12,6 +12,8 @@
 
 #include <stdint.h>
 
+struct syscall_regs;
+
 #define TASK_RUNNING 0
 #define TASK_READY   1
 
@@ -19,6 +21,7 @@
 
 typedef struct task {
     uint32_t pid;
+    uint32_t brk;
     uint32_t esp;
     uint32_t cr3;
     uint32_t state;
@@ -30,6 +33,9 @@ typedef struct task {
 
 void task_init(void);
 void task_create(void* entry_point);
+int32_t task_fork(struct syscall_regs* regs);
+int32_t task_execve(const char* path, const char* const* argv,
+                    const char* const* envp, struct syscall_regs* regs);
 void schedule(void);
 void task_destroy(void);
 

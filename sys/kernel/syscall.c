@@ -25,14 +25,15 @@ extern void puts_com1(const char* s);
 //     uint32_t iov_len;
 // };
 
-uint32_t current_process_brk = 0x01100000;
-
 uint32_t syscall_handler_c(struct syscall_regs* regs) {
     switch (regs->eax) {
 
         case MASIX_EXIT:
-            while(1);
+        {
+            extern void task_destroy(void);
+            task_destroy();
             return 0;
+        }
 
         case MASIX_READ:
         {
@@ -81,13 +82,13 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             uint32_t new_brk = regs->ebx;
 
             if (new_brk == 0) {
-                return current_process_brk;
+                return current_task->brk;
             }
 
-            if (new_brk >= current_process_brk) {
-                current_process_brk = new_brk;
+            if (new_brk >= current_task->brk) {
+                current_task->brk = new_brk;
             }
-            return current_process_brk;
+            return current_task->brk;
         }
 
         case MASIX_FORK:
@@ -200,9 +201,9 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
         case MASIX_EXECVE:
         {
-            // ebx = const char* filename
-            extern int32_t task_execve(const char* path, struct syscall_regs* regs);
-            return task_execve((const char*)regs->ebx, regs);
+            return task_execve((const char*)regs->ebx,
+                               (const char* const*)regs->ecx,
+                               (const char* const*)regs->edx, regs);
         }
 
         case MASIX_CHDIR:
@@ -250,8 +251,8 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
             uint32_t aligned_len = (length + 4095) & ~4095;
 
-            uint32_t allocated_addr = current_process_brk;
-            current_process_brk += aligned_len;
+            uint32_t allocated_addr = current_task->brk;
+            current_task->brk += aligned_len;
 
             return allocated_addr;
         }

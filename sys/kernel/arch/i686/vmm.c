@@ -96,10 +96,6 @@ int vmm_userspace_create(void) {
      * Это автоматически перенесет маппинг фреймбуфера, MMIO и всех структур ядра,
      * настроенных на этапе загрузки, избавляя от хардкода девайсов в VMM.
      */
-    uint32_t active_cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
-    uint32_t* src_boot_pd = table(active_cr3 & PAGE_MASK);
-
     size_t kernel_start_idx = USER_TOP >> 22;
     for (size_t i = kernel_start_idx; i < 1024; ++i) {
         dst[i] = kernel_page_directory[i];
@@ -157,14 +153,25 @@ int vmm_userspace_clone(uint32_t src_cr3, uint32_t* dst_cr3_out) {
 
         uint32_t* src_pt = table(e & PTE_ADDR_MASK);
         uint32_t dst_pt_phys = pmm_alloc_zeroed();
+        if (!dst_pt_phys) return -1;
         uint32_t* dst_pt = table(dst_pt_phys);
 
         for (size_t j = 0; j < 1024; j++) {
             uint32_t pte = src_pt[j];
             if (!(pte & PAGE_PRESENT)) continue;
 
+            uint32_t virt = ((uint32_t)i << 22) | ((uint32_t)j << 12);
+            uint32_t page_phys = pte & PTE_ADDR_MASK;
+
+            /* Identity mappings are shared kernel plumbing, not process data. */
+            if (page_phys == virt) {
+                dst_pt[j] = pte;
+                continue;
+            }
+
             uint32_t new_page_phys = pmm_alloc_page();
-            memcpy((void*)new_page_phys, (void*)(pte & PTE_ADDR_MASK), PAGE_SIZE);
+            if (!new_page_phys) return -1;
+            memcpy((void*)new_page_phys, (void*)page_phys, PAGE_SIZE);
             dst_pt[j] = (new_page_phys & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK);
         }
         dst[i] = dst_pt_phys | (e & ~PTE_ADDR_MASK);
@@ -186,7 +193,11 @@ int vmm_userspace_destroy(uint32_t cr3) {
         uint32_t* pt = table(e & PTE_ADDR_MASK);
         if (pt) {
             for (size_t j = 0; j < 1024; j++) {
-                if (pt[j] & PAGE_PRESENT) pmm_free_page(pt[j] & PTE_ADDR_MASK);
+                if (pt[j] & PAGE_PRESENT) {
+                    uint32_t virt = ((uint32_t)i << 22) | ((uint32_t)j << 12);
+                    uint32_t phys = pt[j] & PTE_ADDR_MASK;
+                    if (phys != virt) pmm_free_page(phys);
+                }
             }
             pmm_free_page(e & PTE_ADDR_MASK);
         }
@@ -203,6 +214,11 @@ uint32_t vmm_user_cr3(void) {
 void vmm_user_switch(void) {
     if (!g_user_valid) return;
     __asm__ volatile ("mov %0, %%cr3" :: "r"(g_user.pd_phys) : "memory");
+}
+
+void vmm_switch_cr3(uint32_t cr3) {
+    if (!cr3) return;
+    __asm__ volatile ("mov %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
 int vmm_kernel_map(uint32_t virt, uint32_t phys, uint32_t flags) {

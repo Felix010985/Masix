@@ -12,6 +12,7 @@
 #include <drivers/serial.h>
 #include <vmm.h>
 #include <pmm.h>
+#include <vfs.h>
 
 typedef struct {
     unsigned char e_ident[16];
@@ -47,12 +48,19 @@ extern void* memcpy(void* dst, const void* src, unsigned int n);
 extern void* memset(void* dst, int value, unsigned int n);
 extern void printf(const char* fmt, ...);
 
+static int elf_header_valid(const Elf32_Ehdr* header, uint32_t file_size) {
+    if (header->e_ident[0] != 0x7F || header->e_ident[1] != 'E' ||
+        header->e_ident[2] != 'L' || header->e_ident[3] != 'F') return 0;
+    if (header->e_phentsize != sizeof(Elf32_Phdr)) return 0;
+    if (header->e_phoff > file_size ||
+        header->e_phnum > (file_size - header->e_phoff) / sizeof(Elf32_Phdr)) return 0;
+    return 1;
+}
+
 void* elf_load_binary(uint32_t file_start) {
     Elf32_Ehdr* elf_header = (Elf32_Ehdr*)file_start;
 
-    if (elf_header->e_ident[0] != 0x7F || elf_header->e_ident[1] != 'E'  ||
-        elf_header->e_ident[2] != 'L'  || elf_header->e_ident[3] != 'F')
-    {
+    if (!elf_header_valid(elf_header, 0xFFFFFFFFU)) {
         puts_com1("Masix: ELF: Invalid magic signature!\n");
         return NULL;
     }
@@ -110,4 +118,42 @@ void* elf_load_binary(uint32_t file_start) {
 
     return (void*)entry;
     //return (void*)elf_header->e_entry;
+}
+
+void* elf_load_node(vfs_node_t* node) {
+    Elf32_Ehdr header;
+    if (!node || !node->read || node->read(node, 0, sizeof(header), (uint8_t*)&header) != sizeof(header) ||
+        !elf_header_valid(&header, node->size)) {
+        return NULL;
+    }
+
+    if (vmm_userspace_create() != 0) return NULL;
+
+    for (uint16_t i = 0; i < header.e_phnum; i++) {
+        Elf32_Phdr phdr;
+        uint32_t offset = header.e_phoff + (uint32_t)i * sizeof(phdr);
+        if (node->read(node, offset, sizeof(phdr), (uint8_t*)&phdr) != sizeof(phdr)) goto fail;
+        if (phdr.p_type != PT_LOAD || phdr.p_memsz < phdr.p_filesz ||
+            phdr.p_offset > node->size || phdr.p_filesz > node->size - phdr.p_offset ||
+            phdr.p_vaddr >= USER_TOP || phdr.p_memsz > USER_TOP - phdr.p_vaddr) goto fail;
+
+        uint32_t page_start = phdr.p_vaddr & ~(PAGE_SIZE - 1);
+        uint32_t page_end = (phdr.p_vaddr + phdr.p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        for (uint32_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_zeroed();
+            if (!phys || vmm_user_map(vaddr, phys, (phdr.p_flags & 2) ? PAGE_WRITE : 0) != 0) goto fail;
+        }
+
+        if (phdr.p_filesz && node->read(node, phdr.p_offset, phdr.p_filesz,
+                                        (uint8_t*)phdr.p_vaddr) != (int32_t)phdr.p_filesz) goto fail;
+        if (phdr.p_memsz > phdr.p_filesz) {
+            memset((void*)(phdr.p_vaddr + phdr.p_filesz), 0, phdr.p_memsz - phdr.p_filesz);
+        }
+    }
+
+    vmm_user_switch();
+    return (void*)header.e_entry;
+
+fail:
+    return NULL;
 }

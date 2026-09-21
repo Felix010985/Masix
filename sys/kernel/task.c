@@ -14,7 +14,6 @@
 #include <vfs.h>
 #include <api.h>
 #include <vmm.h>
-#include <pmm.h>
 
 task_t* current_task = NULL;
 static task_t* task_list_head = NULL;
@@ -25,6 +24,7 @@ extern void* malloc(size_t size);
 void task_init(void) {
     task_t* init_task = (task_t*)malloc(sizeof(task_t));
     init_task->pid = next_pid++;
+    init_task->brk = 0x01100000;
     init_task->state = TASK_RUNNING;
     init_task->esp = 0;
     init_task->kernel_stack = (uint8_t*)malloc(4096);
@@ -41,6 +41,7 @@ void task_init(void) {
 void task_create(void* entry_point) {
     task_t* new_task = (task_t*)malloc(sizeof(task_t));
     new_task->pid = next_pid++;
+    new_task->brk = 0x01100000;
     new_task->state = TASK_READY;
     new_task->kernel_stack = (uint8_t*)malloc(4096);
     new_task->user_stack = (uint8_t*)malloc(4096);
@@ -135,36 +136,36 @@ int32_t task_fork(struct syscall_regs* regs) {
         return -12;
     }
 
-    /* Выделяем под стек пользователя физическую страницу из PMM,
-     * а раньше было из кучи ядра (виртуальной памяти).
-     */
-    uint32_t child_user_phys = pmm_alloc_zeroed();
-    if (!child_user_phys) {
+    child->user_stack = (uint8_t*)malloc(4096);
+    if (!child->user_stack) {
         free(child->kernel_stack);
         free(child);
         return -12;
     }
-    child->user_stack = (uint8_t*)table(child_user_phys);
 
-    /* Копируем данные стека пользователя родителя в новый стек дочернего процесса
-    (Для Identity-пейджинга 1в1 первыми 64 МБ к которым принадлежит стек родителя). */
     memcpy(child->user_stack, current_task->user_stack, 4096);
-
     memcpy(child->kernel_stack, current_task->kernel_stack, 4096);
 
     strcpy(child->cwd, current_task->cwd);
+    child->brk = current_task->brk;
 
-    int32_t kstack_offset = (int32_t)child->kernel_stack - (int32_t)current_task->kernel_stack;
-    child->esp = (uint32_t)regs + kstack_offset;
+    if (vmm_userspace_clone(current_task->cr3, &child->cr3) != 0) {
+        free(child->user_stack);
+        free(child->kernel_stack);
+        free(child);
+        return -12;
+    }
+
+    uint32_t frame_offset = (uint32_t)regs - (uint32_t)current_task->kernel_stack;
+    child->esp = (uint32_t)child->kernel_stack + frame_offset;
 
     struct syscall_regs* child_regs = (struct syscall_regs*)child->esp;
     uint32_t* child_iret_frame = (uint32_t*)((uint32_t)child->kernel_stack + 4096);
 
-    uint32_t parent_esp_page_offset = child_iret_frame[-2] & 0xFFF;
-    child_iret_frame[-2] = child_user_phys + parent_esp_page_offset;
-
-    uint32_t parent_ebp_page_offset = child_regs->ebp & 0xFFF;
-    child_regs->ebp = child_user_phys + parent_ebp_page_offset;
+    uint32_t parent_stack_offset = child_iret_frame[-2] - (uint32_t)current_task->user_stack;
+    if (parent_stack_offset < 4096) {
+        child_iret_frame[-2] = (uint32_t)child->user_stack + parent_stack_offset;
+    }
 
     child_regs->eax = 0;
 
@@ -201,6 +202,7 @@ void task_destroy(void) {
 
     free(dead_task->user_stack);
     free(dead_task->kernel_stack);
+    vmm_userspace_destroy(dead_task->cr3);
     free(dead_task);
 
     puts_com1("Masix: Dead task resources fully cleaned from kernel heap.\n");
@@ -224,8 +226,10 @@ void task_destroy(void) {
     : "eax", "ebx", "memory"
     );
 }
-int32_t task_execve(const char* path, struct syscall_regs* regs) {
-    puts_com1("Masix: OnalDebug: task_execve x1");
+int32_t task_execve(const char* path, const char* const* argv,
+                    const char* const* envp, struct syscall_regs* regs) {
+    (void)argv;
+    (void)envp;
     if (!path) return -14; // -EFAULT
 
     /* Открываем файл через VFS */
@@ -242,54 +246,44 @@ int32_t task_execve(const char* path, struct syscall_regs* regs) {
         vfs_close(fd);
         return -13; // -EACCES (Permission denied, если это папка)
     }
-    puts_com1("Masix: OnalDebug: task_execve x2 (VFS Thing)");
-
-    /* Выделяем память под размер ELF-файла */
-    void* elf_buffer = malloc(node->size);
-    if (!elf_buffer) {
-        vfs_close(fd);
-        return -12; // -ENOMEM
-    }
-
-    /* Читаем бинарник с диска в память ядра */
-    int32_t bytes_read = vfs_read(fd, elf_buffer, node->size);
-    vfs_close(fd); // Сразу закрываем файл
-
-    if (bytes_read < (int32_t)node->size) {
-        free(elf_buffer);
-        puts_com1("Masix: OnalDebug: task_execve x3 (Buffer freeing)");
-        return -5; // -EIO
-    }
-
     puts_com1("Masix: sys_execve reloading process image from VFS...\n");
 
-    /* Загружаем считанный ELF */
-    extern void* elf_load_binary(uint32_t file_start);
-    void* entry_point = elf_load_binary((uint32_t)elf_buffer);
-
-    free(elf_buffer); // Освобождаем временный буфер
+    extern void* elf_load_node(vfs_node_t* node);
+    uint32_t old_cr3 = current_task->cr3;
+    void* entry_point = elf_load_node(node);
+    vfs_close(fd);
 
     if (entry_point == NULL) {
+        uint32_t failed_cr3 = vmm_user_cr3();
+        if (old_cr3) vmm_switch_cr3(old_cr3);
+        vmm_userspace_destroy(failed_cr3);
         return -8; // -ENOEXEC
     }
 
-    /* Сбрасываем контекст потока и настраиваем правильный стек */
+    current_task->cr3 = vmm_user_cr3();
+    current_task->brk = 0x01100000;
+    if (old_cr3 && old_cr3 != current_task->cr3) {
+        vmm_userspace_destroy(old_cr3);
+    }
+
+    /* Build the Linux i386 initial stack: argc, argv, envp, then auxv. */
     uint32_t* ustack = (uint32_t*)((uint32_t)current_task->user_stack + 4096);
 
     /* Выделяем место под саму строку аргумента на верхушке стека */
-    char* ustack_str = (char*)ustack - 32;
-    strncpy(ustack_str, path, 31); /* Копируем туда имя запущенного файла, например "bin/init" */
+    size_t path_len = strlen(path) + 1;
+    char* ustack_str = (char*)ustack - path_len;
+    strcpy(ustack_str, path);
 
     /* Пересчитываем указатель стека под выравнивание */
-    uint32_t* args_ptr = (uint32_t*)ustack_str;
+    uint32_t* args_ptr = (uint32_t*)((uint32_t)ustack_str & ~0xFU);
 
     /* Строим плоский массив по (примерному) стандарту Linux i386 ABI */
-    args_ptr[-1] = 0;                    // auxv[0].a_un.a_val = 0 (Конец Auxiliary Vector)
-    args_ptr[-2] = 0;                    // auxv[0].a_type = 0 (AT_NULL)
-    args_ptr[-3] = 0;                    // envp[0] = NULL (Конец массива переменных окружения)
-    args_ptr[-4] = 0;                    // argv[1] = NULL (Конец массива аргументов)
-    args_ptr[-5] = (uint32_t)ustack_str; // argv[0] = Прямой указатель на строку пути
-    args_ptr[-6] = 1;                    // argc = 1
+    args_ptr[-1] = 0;
+    args_ptr[-2] = 0;
+    args_ptr[-3] = 0;
+    args_ptr[-4] = 0;
+    args_ptr[-5] = (uint32_t)ustack_str;
+    args_ptr[-6] = 1;
 
     uint32_t* kstack_iret = (uint32_t*)((uint32_t)current_task->kernel_stack + 4096);
 
