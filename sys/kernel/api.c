@@ -22,59 +22,11 @@ extern char keyboard_getc(void);
 extern file_t fd_table[32];
 
 int32_t k_sys_write(int fd, const char* buf, uint32_t count) {
-    if (fd == 1 || fd == 2) {
-        for (uint32_t i = 0; i < count; i++) tty_write_char(buf[i]);
-        return count;
-    }
-
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_VFS_FILE) {
-        return vfs_write(fd, buf, count);
-    }
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_PIPE_WRITE) return vfs_write(fd, buf, count);
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_UNIX_SOCKET) return vfs_write(fd, buf, count);
-    return -9; // -EBADF
+    return vfs_write(fd, buf, count);
 }
 
 int32_t k_sys_read(int fd, char* buf, uint32_t count) {
-    if (fd == 0) {
-        if (count == 0) return 0;
-
-        uint32_t read_bytes = 0;
-
-        while (read_bytes < count) {
-            char c = keyboard_getc();
-
-            if (c == '\n' || c == '\r') {
-                buf[read_bytes++] = '\n';
-                tty_write_char('\n');
-                break;
-            }
-            else if (c == '\b') {
-                if (read_bytes > 0) {
-                    read_bytes--;
-                    tty_write_char('\b');
-                }
-            }
-            else {
-                buf[read_bytes++] = c;
-                tty_write_char(c);
-
-                if (read_bytes == count) {
-                    break;
-                }
-            }
-        }
-
-        return read_bytes;
-    }
-
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_VFS_FILE) {
-        return vfs_read(fd, buf, count);
-    }
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_PIPE_READ) return vfs_read(fd, buf, count);
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_UNIX_SOCKET) return vfs_socket_recv(fd, buf, count);
-    if (fd >= 3 && fd < 32 && fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_recv(fd, buf, count);
-    return -9; // -EBADF
+    return vfs_read(fd, buf, count);
 }
 
 void sys_putc(char c) {

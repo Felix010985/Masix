@@ -7,9 +7,10 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; version 2 of the License.
  */
+#include <filesystem.h>
+
 #define DISK_SIZE 1024*1024
 #define BLOCK_SIZE 512
-#define MAX_FILES 64
 #define MAX_BLOCKS_PER_FILE 10
 #define TOTAL_BLOCKS (DISK_SIZE / BLOCK_SIZE)
 
@@ -38,29 +39,34 @@ int allocate_block() {
     return -1;
 }
 
-typedef struct {
-    char name[32];
-    unsigned int size;
-    int blocks[MAX_BLOCKS_PER_FILE];
-    int used;
-} FileEntry;
-
 FileEntry file_table[MAX_FILES];
 
 int fs_create(const char* name) {
+    return fs_create_type(name, FS_REGULAR);
+}
+
+int fs_create_type(const char* name, unsigned int type) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (!file_table[i].used) {
             file_table[i].used = 1;
             file_table[i].size = 0;
+            file_table[i].type = type;
+            file_table[i].external_data = 0;
             for (int j = 0; j < MAX_BLOCKS_PER_FILE; j++)
                 file_table[i].blocks[j] = -1;
-            for (int k = 0; k < 31 && name[k]; k++)
+            for (int k = 0; k < 255 && name[k]; k++)
                 file_table[i].name[k] = name[k];
-            file_table[i].name[31] = 0;
+            file_table[i].name[255] = 0;
             return i;
         }
     }
     return -1;
+}
+
+void fs_attach_external(int index, const unsigned char *data, unsigned int size) {
+    if (index < 0 || index >= MAX_FILES || !file_table[index].used) return;
+    file_table[index].external_data = data;
+    file_table[index].size = size;
 }
 
 void fs_delete(int index) {
@@ -74,6 +80,7 @@ void fs_delete(int index) {
 
 int fs_write(int file_index, const unsigned char* data, unsigned int size) {
     FileEntry* f = &file_table[file_index];
+    if (f->external_data) return -30;
     unsigned int written = 0;
     for (int i = 0; i < MAX_BLOCKS_PER_FILE && written < size; i++) {
         if (f->blocks[i] == -1) {
@@ -94,6 +101,12 @@ int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsig
     FileEntry* f = &file_table[file_index];
     if (offset >= f->size) return 0;
     if (size > f->size - offset) size = f->size - offset;
+
+    if (f->external_data) {
+        for (unsigned int i = 0; i < size; i++)
+            buffer[i] = f->external_data[offset + i];
+        return size;
+    }
 
     unsigned int read = 0;
     while (read < size) {

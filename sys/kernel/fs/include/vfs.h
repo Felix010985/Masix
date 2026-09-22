@@ -38,7 +38,7 @@ typedef struct iovec {
 } iovec_t;
 
 typedef struct vfs_node {
-    char name[32];
+    char name[256];
     uint32_t flags;
     uint32_t size;
     int32_t  internal_id;
@@ -50,6 +50,7 @@ typedef struct vfs_node {
 void vfs_init(void);
 
 int32_t vfs_open(const char *path);
+int32_t vfs_open_flags(const char *path, uint32_t flags);
 int32_t vfs_read(int fd, void *buf, uint32_t count);
 int32_t vfs_write(int fd, const void *buf, uint32_t count);
 

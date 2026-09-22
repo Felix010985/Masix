@@ -8,6 +8,7 @@
  * the Free Software Foundation; version 2 of the License.
  */
 #include <vfs.h>
+#include <filesystem.h>
 #include <string.h>
 #include <stdio.h>
 #include <version.h>
@@ -15,17 +16,48 @@
 #include <drivers/serial.h>
 
 mountpoint_t *mountpoints_list = NULL;
-// vfs_node_t* fd_table[32];
 file_t fd_table[32];
+
+extern char keyboard_getc(void);
+extern void tty_write_char(char c);
+
+static int32_t console_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    if (size == 0) return 0;
+
+    uint32_t read = 0;
+    while (read < size) {
+        char c = keyboard_getc();
+        if (c == '\r') c = '\n';
+        buffer[read++] = (uint8_t)c;
+        tty_write_char(c);
+        if (c == '\n') break;
+    }
+    return read;
+}
+
+static int32_t console_write(vfs_node_t *node, uint32_t offset, uint32_t size, const uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    for (uint32_t i = 0; i < size; i++) tty_write_char((char)buffer[i]);
+    return size;
+}
+
+static vfs_node_t console_node = {
+    .name = "console",
+    .flags = VFS_FILE,
+    .size = 0,
+    .internal_id = -1,
+    .read = console_read,
+    .write = console_write
+};
 
 extern int fs_create(const char* name);
 extern int fs_read(int file_index, unsigned char* buffer, unsigned int size);
 extern int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsigned int size);
 extern int fs_write(int file_index, const unsigned char* data, unsigned int size);
-typedef struct { char name[32]; unsigned int size; int used; } FileEntry;
 extern FileEntry file_table[];
-
-static mountpoint_t *mount_list = NULL;
 
 typedef struct {
     uint8_t data[PIPE_SIZE];
@@ -193,8 +225,8 @@ void vfs_mount_core(const char *path, fsdriver_t *driver) {
 
     strncpy(mp->path, path, 32);
     mp->driver = driver;
-    mp->next = mount_list;
-    mount_list = mp;
+    mp->next = mountpoints_list;
+    mountpoints_list = mp;
 }
 
 // void vfs_init(void) {
@@ -210,9 +242,12 @@ void vfs_init(void) {
         fd_table[i].private_data = NULL;
     }
 
-    fd_table[0].type = FT_DEVICE; // stdin
-    fd_table[1].type = FT_DEVICE; // stdout
-    fd_table[2].type = FT_DEVICE; // stderr
+    fd_table[0].type = FT_DEVICE;
+    fd_table[1].type = FT_DEVICE;
+    fd_table[2].type = FT_DEVICE;
+    fd_table[0].private_data = &console_node;
+    fd_table[1].private_data = &console_node;
+    fd_table[2].private_data = &console_node;
 
     // монтирование procfs
     extern fsdriver_t procfs_driver;
@@ -222,15 +257,15 @@ void vfs_init(void) {
 }
 
 int32_t vfs_open(const char *path) {
-    puts_com1("Masix: OnalDebug: vfs_open started\n");
+    return vfs_open_flags(path, 0);
+}
+
+int32_t vfs_open_flags(const char *path, uint32_t flags) {
     int fd = -1;
-    puts_com1("Masix: OnalDebug: vfs_open started\n");
     for (int i = 3; i < MAX_FD; i++) {
         if (fd_table[i].type == FT_EMPTY) { fd = i; break; }
     }
-    puts_com1("Masix: OnalDebug: vfs_open started\n");
     if (fd == -1) return -24; // -EMFILE
-    puts_com1("Masix: OnalDebug: vfs_open started\n");
     extern void* malloc(size_t size);
     vfs_node_t* node = (vfs_node_t*)malloc(sizeof(vfs_node_t));
     if (!node) return -12; // -ENOMEM
@@ -240,52 +275,34 @@ int32_t vfs_open(const char *path) {
      */
     extern mountpoint_t *mountpoints_list;
 
+    mountpoint_t *best_mount = NULL;
+    size_t best_length = 0;
     for (mountpoint_t *mp = mountpoints_list; mp != NULL; mp = mp->next) {
-        puts_com1("Masix: OnalDebug: vfs_open started\n");
         size_t len = strlen(mp->path);
-        if (strncmp(path, mp->path, len) == 0) {
-            /* Если точка монтирования это корень "/" (len == 1)
-             * или если следующий символ после префикса - слэш/конец строки
-             */
-            if (len == 1 && (strncmp(path, "/proc", 5) == 0 || strncmp(path, "/sys", 4) == 0 || strncmp(path, "/dev", 4) == 0)) {
-                continue;
-            }
-            if (len == 1 || path[len] == '/' || path[len] == '\0') {
-                puts_com1("Masix: OnalDebug: vfs_open matched mountpoint!\n");
-                 /* Если длина точки монтирования 0 или 1, либо первый символ '/' или '\0' -
-                 * это корень или пустой дефолтный mount. Выходим из цикла монтирования к file_table!
-                 */
-                if (len <= 1 || mp->path[0] == '/' || mp->path[0] == '\0') {
-                    break;
-                }
-
-                const char *subpath = path + len;
-                if (*subpath == '/') subpath++;
-
-                int32_t res = mp->driver->open(subpath, node);
-
-                puts_com1("Masix: OnalDebug: vfs_open started HERE\n"); // <-- Потом это
-                //printf("Masix: OnalDebug: Driver open returned code: %d\n", res);
-                if (res == 0) {
-                    fd_table[fd].type = FT_VFS_FILE;
-                    puts_com1("Masix: OnalDebug: fd_table[fd].type = FT_VFS_FILE\n");
-                    fd_table[fd].offset = 0;
-                    puts_com1("Masix: OnalDebug: fd_table[fd].offset = 0\n");
-                    fd_table[fd].private_data = (void*)node;
-                    puts_com1("Masix: OnalDebug: vfs_open started and return fd\n");
-                    return fd;
-                }
-
-                extern void free(void* ptr);
-                free(node);
-                return res;
-            }
+        if (len > best_length && strncmp(path, mp->path, len) == 0 &&
+            (len == 1 || path[len] == '/' || path[len] == '\0')) {
+            best_mount = mp;
+            best_length = len;
         }
     }
-    puts_com1("Masix: OnalDebug: vfs_open started x2\n");
 
+    if (best_mount && best_length > 1) {
+        const char *subpath = path + best_length;
+        if (*subpath == '/') subpath++;
+        int32_t result = best_mount->driver->open(subpath, node);
+        if (result == 0) {
+            fd_table[fd].type = FT_VFS_FILE;
+            fd_table[fd].offset = 0;
+            fd_table[fd].private_data = node;
+            return fd;
+        }
+
+        extern void free(void* ptr);
+        free(node);
+        return result;
+    }
     int file_idx = -1;
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < MAX_FILES; i++) {
         if (file_table[i].used && strcmp(file_table[i].name, path) == 0) {
             file_idx = i;
             break;
@@ -293,21 +310,25 @@ int32_t vfs_open(const char *path) {
     }
 
     if (file_idx == -1) {
+        if (!(flags & 0x40)) {
+            extern void free(void* ptr);
+            free(node);
+            return -2;
+        }
         file_idx = fs_create(path);
         if (file_idx == -1) {
             extern void free(void* ptr);
             free(node);
             return -28;
         } // -ENOSPC
-        puts_com1("Masix: OnalDebug: vfs_open ended\n");
     }
 
     strcpy(node->name, file_table[file_idx].name);
-    node->flags = VFS_FILE;
+    node->flags = file_table[file_idx].type == FS_DIRECTORY ? VFS_DIRECTORY : VFS_FILE;
     node->size = file_table[file_idx].size;
     node->internal_id = file_idx;
-    node->read = ramfs_read;
-    node->write = ramfs_write;
+    node->read = node->flags == VFS_FILE ? ramfs_read : NULL;
+    node->write = node->flags == VFS_FILE ? ramfs_write : NULL;
 
     fd_table[fd].type = FT_VFS_FILE;
     fd_table[fd].offset = 0;
@@ -318,6 +339,10 @@ int32_t vfs_open(const char *path) {
 
 int32_t vfs_read(int fd, void *buf, uint32_t count) {
     if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) return -9;
+    if (fd_table[fd].type == FT_DEVICE) {
+        vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
+        return node && node->read ? node->read(node, fd_table[fd].offset, count, (uint8_t*)buf) : -9;
+    }
     if (fd_table[fd].type == FT_PIPE_READ) return pipe_read((pipe_t*)fd_table[fd].private_data, (uint8_t*)buf, count);
     if (fd_table[fd].type == FT_UNIX_SOCKET) return vfs_socket_recv(fd, buf, count);
     if (fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_recv(fd, buf, count);
@@ -331,6 +356,10 @@ int32_t vfs_read(int fd, void *buf, uint32_t count) {
 
 int32_t vfs_write(int fd, const void *buf, uint32_t count) {
     if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) return -9;
+    if (fd_table[fd].type == FT_DEVICE) {
+        vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
+        return node && node->write ? node->write(node, fd_table[fd].offset, count, (const uint8_t*)buf) : -9;
+    }
     if (fd_table[fd].type == FT_PIPE_WRITE) return pipe_write((pipe_t*)fd_table[fd].private_data, (const uint8_t*)buf, count);
     if (fd_table[fd].type == FT_UNIX_SOCKET) return vfs_socket_send(fd, buf, count);
     if (fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_send(fd, buf, count);

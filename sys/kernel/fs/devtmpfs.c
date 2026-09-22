@@ -44,6 +44,24 @@ static int32_t dev_full_write(vfs_node_t *node, uint32_t offset, uint32_t size, 
     return -28;
 }
 
+static int32_t dev_tty_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    extern char keyboard_getc(void);
+    extern void tty_write_char(char c);
+    if (size == 0) return 0;
+
+    uint32_t read = 0;
+    while (read < size) {
+        char c = keyboard_getc();
+        if (c == '\r') c = '\n';
+        buffer[read++] = (uint8_t)c;
+        tty_write_char(c);
+        if (c == '\n') break;
+    }
+    return read;
+}
+
 static uint32_t random_state = 0x4D617A75;
 
 static int32_t dev_random_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
@@ -69,8 +87,8 @@ int32_t devtmpfs_open(const char *subpath, vfs_node_t *node) {
     node->write = dev_null_write;
     if (strcmp(subpath, "null") == 0) { strcpy(node->name, "null"); node->internal_id = DEV_NULL; return 0; }
     if (strcmp(subpath, "zero") == 0) { strcpy(node->name, "zero"); node->internal_id = DEV_ZERO; node->read = dev_zero_read; return 0; }
-    if (strcmp(subpath, "tty") == 0) { strcpy(node->name, "tty"); node->internal_id = DEV_TTY; node->write = dev_tty_write; return 0; }
-    if (strcmp(subpath, "console") == 0) { strcpy(node->name, "console"); node->internal_id = DEV_CONSOLE; node->write = dev_tty_write; return 0; }
+    if (strcmp(subpath, "tty") == 0) { strcpy(node->name, "tty"); node->internal_id = DEV_TTY; node->read = dev_tty_read; node->write = dev_tty_write; return 0; }
+    if (strcmp(subpath, "console") == 0) { strcpy(node->name, "console"); node->internal_id = DEV_CONSOLE; node->read = dev_tty_read; node->write = dev_tty_write; return 0; }
     if (strcmp(subpath, "full") == 0) { strcpy(node->name, "full"); node->internal_id = DEV_FULL; node->read = dev_full_read; node->write = dev_full_write; return 0; }
     if (strcmp(subpath, "random") == 0) { strcpy(node->name, "random"); node->internal_id = DEV_RANDOM; node->read = dev_random_read; return 0; }
     return -2;

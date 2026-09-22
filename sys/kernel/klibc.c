@@ -179,21 +179,6 @@ void print_num(int n) {
     print_str(buf);
 }
 
-static int current_color = 0x0F;
-
-void set_color(int color) {
-    current_color = color;
-}
-
-void reset_color() {
-    current_color = 0x0F;
-}
-
-static void putc_color(char c) {
-    (void)current_color;
-    tty_write_char(c);
-}
-
 static void internal_kernel_read_line(char* buf, int max_len) {
     int read_bytes = 0;
     while (read_bytes < max_len - 1) {
@@ -224,28 +209,25 @@ void printf(const char* fmt, ...) {
             i++;
             if (fmt[i] == 's') {
                 const char* s = va_arg(args, const char*);
-                for (int j = 0; s[j]; j++)
-                    putc_color(s[j]);
+                print_str(s);
             } else if (fmt[i] == 'd') {
                 int num = va_arg(args, int);
                 char buf[32];
                 itoa(num, buf, 10);
-                for (int j = 0; buf[j]; j++)
-                    putc_color(buf[j]);
+                print_str(buf);
             } else if (fmt[i] == 'x') {
                 int num = va_arg(args, int);
                 char buf[32];
                 itoa(num, buf, 16);
-                for (int j = 0; buf[j]; j++)
-                    putc_color(buf[j]);
+                print_str(buf);
             } else if (fmt[i] == 'c') {
                 char c = (char)va_arg(args, int);
-                putc_color(c);
+                tty_write_char(c);
             } else if (fmt[i] == '%') {
-                putc_color('%');
+                tty_write_char('%');
             }
         } else {
-            putc_color(fmt[i]);
+            tty_write_char(fmt[i]);
         }
     }
 

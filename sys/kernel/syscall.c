@@ -13,17 +13,11 @@
 #include <vfs.h>
 #include <task.h>
 #include <api.h>
+#include <string.h>
 
-extern int32_t k_sys_write(int fd, const char* buf, uint32_t count);
-extern int32_t k_sys_read(int fd, char* buf, uint32_t count);
 extern void idt_register_handler(uint8_t vector, uint32_t handler_addr, uint8_t flags);
 extern void itoa(int value, char* str, int base);
 extern void puts_com1(const char* s);
-
-// struct iovec {
-//     void* iov_base;
-//     uint32_t iov_len;
-// };
 
 uint32_t syscall_handler_c(struct syscall_regs* regs) {
     switch (regs->eax) {
@@ -36,21 +30,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_READ:
-        {
-            int fd = regs->ebx;
-            char* user_buf = (char*)regs->ecx;
-            uint32_t count = regs->edx;
-
-            if (fd < 3) {
-                extern int32_t k_sys_read(int fd, char* buf, uint32_t count);
-                return k_sys_read(fd, user_buf, count);
-            }
-
-            if (fd >= 32 || fd_table[fd].type == 0) { // FT_EMPTY
-                return -9; // -EBADF
-            }
-            return vfs_read(fd, user_buf, count);
-        }
+            return k_sys_read((int)regs->ebx, (char*)regs->ecx, regs->edx);
 
         case MASIX_WRITE:
             return k_sys_write(regs->ebx, (const char*)regs->ecx, regs->edx);
@@ -125,7 +105,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             // ecx = указатель на массив структур struct iovec
             // edx = количество элементов в этом массиве (iovcnt)
             int fd = regs->ebx;
-            const struct iovec* iov = (const struct iovec*)regs->ecx;
+            const iovec_t* iov = (const iovec_t*)regs->ecx;
             int iovcnt = regs->edx;
 
             if (iov == NULL) return -9; // -EFAULT
@@ -135,7 +115,6 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             for (int i = 0; i < iovcnt; i++) {
                 if (iov[i].iov_base != NULL && iov[i].iov_len > 0) {
 
-                    extern int32_t k_sys_write(int fd, const char* buf, uint32_t count);
                     int32_t ret = k_sys_write(fd, (const char*)iov[i].iov_base, iov[i].iov_len);
 
                     if (ret < 0) return ret;
@@ -154,18 +133,14 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             const char* path = (const char*)regs->ebx;
             if (path == NULL) return -14; // -EFAULT
 
-            int32_t fd = vfs_open(path);
-            if (fd < 0) {
-                return -2;
-            }
+            int32_t fd = vfs_open_flags(path, regs->ecx);
             return fd;
         }
 
         case MASIX_IOCTL:
-            return 0;
+            return -LINUX_ENOSYS;
 
         case MASIX_GETPID:
-            extern task_t* current_task;
             return current_task->pid;
 
         case MASIX_MOUNT:
@@ -181,8 +156,6 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             unsigned long flags = (unsigned long)regs->esi;
             const void* data    = (const void*)regs->edi;
 
-            extern int32_t sys_mount(const char* source, const char* target, const char* filesystemtype, unsigned long flags, const void* data);
-
             return sys_mount(source, target, fstype, flags, data);
         }
 
@@ -193,7 +166,6 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         {
             puts_com1("Masix: SYS: Process called exit_group. Cleaning up...\n");
 
-            extern void task_destroy(void);
             task_destroy();
 
             return 0;
@@ -213,37 +185,25 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_FCNTL:
-            return 0;
+            return -LINUX_ENOSYS;
 
         case MASIX_DUP2:
         {
             int32_t oldfd = (int32_t)regs->ebx;
             int32_t newfd = (int32_t)regs->ecx;
 
-            extern int32_t sys_dup2(int32_t oldfd, int32_t newfd);
             return sys_dup2(oldfd, newfd);
         }
 
         case MASIX_FSTAT:
-            return 0;
+            return -LINUX_ENOSYS;
 
         case MASIX_WAIT4:
-        {
-            int32_t pid = (int32_t)regs->ebx;
-            int32_t* wstatus = (int32_t*)regs->ecx;
-
-            if (wstatus) {
-                *wstatus = 0;
-            }
-
-            return pid;
-        }
+            return -LINUX_ENOSYS;
 
         case MASIX_RT_SIGACTION:
-            return 0;
-
         case MASIX_TKILL:
-            return 0;
+            return -LINUX_ENOSYS;
 
         case MASIX_MMAP2:
         {
@@ -262,29 +222,29 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
         case MASIX_GETCWD:
         {
-            // ebx = char* buf, ecx = unsigned long size
             char* user_buf = (char*)regs->ebx;
             uint32_t size = regs->ecx;
+            uint32_t cwd_length;
 
-            if (user_buf != NULL && size > 2) {
-                user_buf[0] = '/';
-                user_buf[1] = '\0';
-                return (uint32_t)user_buf;
-            }
-            return 0;
+            if (!user_buf || !current_task || size == 0) return -14;
+            cwd_length = strlen(current_task->cwd);
+            if (cwd_length + 1 > size) return -34;
+            memcpy(user_buf, current_task->cwd, cwd_length + 1);
+            return (uint32_t)user_buf;
         }
 
         case MASIX_FCNTL64:
-            // ebx = fd, ecx = cmd, edx = arg
-            return 0;
-
         case MASIX_UGETRLIMIT:
-            // ebx = resource, ecx = struct rlimit*
-            return 0;
-
         case MASIX_GETDENTS:
-            // ebx = fd, ecx = struct linux_dirent*, edx = count
-            return 0;
+        case MASIX_STAT64:
+        case MASIX_FSTAT64:
+        case MASIX_FSTAT64_ALT:
+        case MASIX_NANOSLEEP:
+        case MASIX_CLOCK_GETTIME64:
+        case MASIX_PRLIMIT64:
+        case MASIX_STATX:
+        case MASIX_PSELECT6:
+            return -LINUX_ENOSYS;
 
         case MASIX_GETUID:
         case MASIX_GETEUID:
@@ -292,13 +252,6 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         case MASIX_GETGID32:
         case MASIX_GETEGID:
 
-            return 0;
-
-        case MASIX_STAT64:
-        case MASIX_FSTAT64:
-        case MASIX_FSTAT64_ALT:
-        case MASIX_NANOSLEEP:
-            // ebx = fd или путь, ecx = struct stat*
             return 0;
 
         case MASIX_POLL:
@@ -323,25 +276,9 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             return nfds; /* Возвращаем количество готовых дескрипторов */
         }
 
-        case MASIX_CLOCK_GETTIME64:
-            // ebx = clock_id, ecx = struct timespec64*
-            return 0;
-
         case MASIX_GETPGID:
             // ebx = pid. Если ebx == 0, возвращаем PGID текущего процесса.
             return 1;
-
-        case MASIX_PRLIMIT64:
-            // ebx = pid, ecx = resource, edx = new_limit, esi = old_limit
-            return 0;
-
-        case MASIX_STATX:
-            // ebx = dfd, ecx = filename, edx = flags, esi = mask, edi = buffer
-            return 0;
-
-        case MASIX_PSELECT6:
-            // ebx = n, ecx = inp, edx = outp, esi = exp, edi = tsp
-            return 0;
 
         case MASIX_MUNMAP:
         {
@@ -362,19 +299,14 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             uint64_t* res_ptr = (uint64_t*)regs->esi;
             uint32_t whence = regs->edi;
 
-            struct fd_entry {
-                int type;
-                uint32_t offset;
-                void* private_data;
-            };
-            //extern struct fd_entry fd_table[32];
-
-            if (fd >= 32 || fd_table[fd].type == 0) {
+            if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) {
                 return -9; // -EBADF
             }
 
             vfs_node_t* node = (vfs_node_t*)fd_table[fd].private_data;
             uint64_t offset = ((uint64_t)offset_high << 32) | offset_low;
+
+            if (!node || fd_table[fd].type != FT_VFS_FILE) return -29; // -ESPIPE
 
             if (whence == 0) {         // SEEK_SET
                 fd_table[fd].offset = (uint32_t)offset;
@@ -394,6 +326,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         default:
+        {
             char stub_buf[16];
             itoa(regs->eax, stub_buf, 10);
 
@@ -402,6 +335,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             puts_com1("\n");
 
             return -LINUX_ENOSYS;
+        }
     }
 }
 

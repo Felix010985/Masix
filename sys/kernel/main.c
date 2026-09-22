@@ -94,9 +94,9 @@ void unpack_initramfs(uint32_t archive_start, uint32_t archive_size) {
         uint32_t data_offset = (sizeof(struct cpio_newc_header) + namesize + 3) & ~3;
         uint8_t* file_data = ptr + data_offset;
 
-        if (filesize > 0 && strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0) {
+        if (strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0) {
 
-            char clean_path[64];
+            char clean_path[256];
 
             // Если имя в архиве начинается с "./", заменяем "." на "/"
             if (memcmp(filename, "./", 2) == 0) {
@@ -115,10 +115,12 @@ void unpack_initramfs(uint32_t archive_start, uint32_t archive_size) {
 
             clean_path[sizeof(clean_path) - 1] = '\0'; // Гарантируем нуль терминатор
 
-            int idx = fs_create(clean_path);
+            uint32_t mode = parse_hex_ascii(header->c_mode, 8);
+            unsigned int type = (mode & 0170000) == 0040000 ? FS_DIRECTORY : FS_REGULAR;
+            int idx = fs_create_type(clean_path, type);
             if (idx != -1) {
                 /* Регистрируем cpio файл в VFS */
-                fs_write(idx, file_data, filesize);
+                if (type == FS_REGULAR) fs_attach_external(idx, file_data, filesize);
 
                 puts_com1("Masix: Registered cpio file in VFS: ");
                 puts_com1(clean_path);

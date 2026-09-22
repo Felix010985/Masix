@@ -24,6 +24,8 @@ void sys_cls(void);
 void sys_read_line(char* buffer, uint8_t color);
 int32_t sys_mount(const char *source, const char *target, const char *filesystemtype, unsigned long flags, const void *data);
 int32_t sys_dup2(int32_t oldfd, int32_t newfd);
+int32_t k_sys_write(int fd, const char *buf, uint32_t count);
+int32_t k_sys_read(int fd, char *buf, uint32_t count);
 
 int strcmp(const char* a, const char* b);
 

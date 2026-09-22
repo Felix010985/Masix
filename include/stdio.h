@@ -5,8 +5,6 @@
 void print_str(const char* s); // стринги
 void print_num(int n);
 
-static void putc_color(char c);
-
 void printf(const char* fmt, ...);
 int scanf(const char *fmt, ...);
 char *fgets(char *buf, int size, void *unused_stream);
