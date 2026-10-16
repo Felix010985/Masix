@@ -20,13 +20,13 @@
  *   fb=vbe    просить режим у VBE (BIOS)
  *   fb=gop    просить режим у GOP (EFI)
  *   fb=none   ничего не просить, консоль остается текстовой VGA
- *   fb=auto   поведение по умолчанию
+ *   fb=auto   поведение по умолчанию: GOP под UEFI, VBE под BIOS
  *
- * Почему по умолчанию не зовется VBE: в SeaBIOS внутри QEMU этот вызов
- * не возвращает управление, а незавершившийся вызов BIOS остановил бы
- * ядро целиком. Поэтому VBE включают запросом fb=vbe, а под UEFI режим
- * сразу спрашивают у GOP: это обычный вызов протокола, для него реальный
- * режим не нужен и зависать нечему. */
+ * Под UEFI режим спрашивают у GOP: это обычный вызов протокола, реальный
+ * режим для него не нужен и зависать нечему. Под BIOS режим спрашивают у
+ * VBE через INT 10h. Раньше этот путь не звали по умолчанию, потому что
+ * вызов BIOS не возвращал управление из-за ошибки в переходе в реальный
+ * режим (realmode.c); ошибка исправлена, и теперь VBE - обычный источник. */
 
 /* Режимы выбора источника. */
 enum framebuffer_request_mode {
@@ -80,8 +80,10 @@ int framebuffer_request_dispatch(struct framebuffer_info* out) {
         }
     }
 
-    /* VBE: только по явной просьбе fb=vbe, см. замечание в шапке файла. */
-    if (mode == FRAMEBUFFER_REQUEST_VBE) {
+    /* VBE: через INT 10h. Под BIOS это источник по умолчанию, под UEFI -
+     * только по явной просьбе fb=vbe. */
+    if (mode == FRAMEBUFFER_REQUEST_VBE ||
+        (mode == FRAMEBUFFER_REQUEST_AUTO && boot_info.firmware == BOOT_FIRMWARE_BIOS)) {
         if (vbe_request(out) == 0) {
             debug_puts("Masix: framebuffer requested from VBE\n");
             return 0;

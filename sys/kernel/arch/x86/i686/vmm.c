@@ -332,7 +332,7 @@ uint32_t vmm_map_mmio(uint32_t phys, uint32_t size) {
     if (size > VMM_MMIO_SIZE) return 0;
 
     uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint32_t pd_idx = VMM_MMIO_BASE >> 22;
+    uint32_t mmio_pd = VMM_MMIO_BASE >> 22;
 
     uint32_t cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
@@ -340,24 +340,29 @@ uint32_t vmm_map_mmio(uint32_t phys, uint32_t size) {
     uint32_t* pd = vmm_phys_to_virt(cr3 & PTE_ADDR_MASK);
     if (!pd) return 0;
 
-    uint32_t* pt;
-    if (!(pd[pd_idx] & PAGE_PRESENT)) {
-        uint32_t pt_phys = pmm_alloc_zeroed();
-        if (!pt_phys) return 0;
-        pd[pd_idx] = pt_phys | PAGE_PRESENT | PAGE_WRITE;
-        pt = vmm_phys_to_virt(pt_phys);
-    } else {
-        pt = vmm_phys_to_virt(pd[pd_idx] & PTE_ADDR_MASK);
-    }
-    if (!pt) return 0;
+    /* Окно MMIO занимает до VMM_MMIO_SIZE (16 МБ), то есть до четырех
+     * записей каталога по 4 МБ. На каждую такую запись нужна своя
+     * таблица страниц: одной на все окно не хватило бы, и все, что дальше
+     * первых 4 МБ, осталось бы неотображенным. */
+    for (uint32_t page = 0; page < pages; page++) {
+        uint32_t pd_idx = mmio_pd + (page >> 10);
+        uint32_t pt_idx = page & 0x3FF;
 
-    for (uint32_t i = 0; i < pages; i++) {
-        pt[i] = (phys + i * PAGE_SIZE) | PAGE_PRESENT | PAGE_WRITE;
-    }
+        uint32_t* pt;
+        if (!(pd[pd_idx] & PAGE_PRESENT)) {
+            uint32_t pt_phys = pmm_alloc_zeroed();
+            if (!pt_phys) return 0;
+            pd[pd_idx] = pt_phys | PAGE_PRESENT | PAGE_WRITE;
+            pt = vmm_phys_to_virt(pt_phys);
+        } else {
+            pt = vmm_phys_to_virt(pd[pd_idx] & PTE_ADDR_MASK);
+        }
+        if (!pt) return 0;
 
-    /* Сбрасываем TLB для отображенных адресов */
-    for (uint32_t i = 0; i < pages; i++) {
-        __asm__ volatile ("invlpg (%0)" : : "r"(VMM_MMIO_BASE + i * PAGE_SIZE) : "memory");
+        pt[pt_idx] = (phys + page * PAGE_SIZE) | PAGE_PRESENT | PAGE_WRITE;
+
+        /* Сбрасываем TLB для отображенного адреса */
+        __asm__ volatile ("invlpg (%0)" : : "r"(VMM_MMIO_BASE + page * PAGE_SIZE) : "memory");
     }
 
     return VMM_MMIO_BASE;

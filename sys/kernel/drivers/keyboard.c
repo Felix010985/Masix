@@ -38,7 +38,7 @@ static const char scancode_shift_table[128] = {
     '*',0,' ',0,
 };
 
-static void keyboard_push(char c) {
+void keyboard_push_char(char c) {
     int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
     if (next != kbd_tail) {
         kbd_buffer[kbd_head] = c;
@@ -62,7 +62,7 @@ void keyboard_handler_c(void) {
 
         char c = shift ? scancode_shift_table[sc] : scancode_table[sc];
         if (c) {
-            keyboard_push(c);
+            keyboard_push_char(c);
         }
     }
 }

@@ -62,8 +62,11 @@ void main_kernel_main(void) {
     tss_write(5, 0x10, (uint32_t)tss_kernel_stack + 4096);
     asm volatile("ltr %%ax" : : "a"(0x28));
 
-#if defined(DEBUG_OUTPUT_SERIAL) && DEBUG_LEVEL >= DEBUG_LEVEL_INFO
+    /* UART нужен и отладочному выводу, и приему по COM1, поэтому
+     * настраиваем его всегда, независимо от выбранного бэкенда. */
     serial_init();
+
+#if defined(DEBUG_OUTPUT_SERIAL) && DEBUG_LEVEL >= DEBUG_LEVEL_INFO
     debug_puts("COM1 Successfully initialized!\n");
 #endif
 
@@ -134,6 +137,10 @@ void main_kernel_main(void) {
 
     pic_init();
     keyboard_init();
+
+    /* Прием по COM1 включаем только теперь: до pic_init() IRQ4 идет
+     * на другой вектор, и прерывание ушло бы не туда. */
+    serial_input_init();
 
     pit_init(100);
     debug_puts("Masix: PIT Timer registered at 100Hz.\n");

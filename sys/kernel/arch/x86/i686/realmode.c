@@ -37,13 +37,15 @@
 #define REALMODE_CR0_OFF    0x0090    /* спасенное значение CR0 */
 #define REALMODE_CR3_OFF    0x00C0    /* спасенное значение CR3 */
 #define REALMODE_CR4_OFF    0x00D0    /* спасенное значение CR4 */
+#define REALMODE_ESP_OFF    0x00E0    /* спасенная вершина стека ядра */
 #define REALMODE_IDT_OFF    0x00A0    /* псевдодескриптор IDT для реального режима */
 #define REALMODE_STACK_TOP  0x5000    /* вершина стека реального режима */
 
 /* Селекторы временного GDT. Селектор 16-битного кода обязан равняться
- * базе сегмента, поделенной на 16: в реальном режиме возврат из прерывания
- * загружает CS как значение селектора, а база считается по правилу sel * 16.
- * При базе 0 и селекторе 0x08 правило совпадает с дескриптором. */
+ * базе сегмента, поделенной на 16: реальный режим считает базу сегмента
+ * как sel * 16, и именно так BIOS возвращается из прерывания командой iret.
+ * Поэтому дескриптор кода 16 бит строится с базой REALMODE_CODE16_BASE,
+ * а вход в станок идет по смещению REALMODE_STUB_ENTER. */
 #define REALMODE_SEL_NULL   0x00
 #define REALMODE_SEL_CODE16 0x08
 #define REALMODE_SEL_DATA16 0x10
@@ -53,8 +55,21 @@
 #define KERNEL_SEL_CODE 0x08
 #define KERNEL_SEL_DATA 0x10
 
+/* База сегмента 16-битного кода и смещение входа в станок: станок лежит
+ * по линейному адресу REALMODE_SCRATCH + REALMODE_STUB_OFF, значит смещение
+ * входа на величину базы меньше. */
+#define REALMODE_CODE16_BASE (REALMODE_SEL_CODE16 << 4)
+#define REALMODE_STUB_ENTER  (REALMODE_SCRATCH + REALMODE_STUB_OFF - REALMODE_CODE16_BASE)
+
+/* Подстановка значения в строку ассемблерной вставки. */
+#define REALMODE_STR2(x) #x
+#define REALMODE_STR(x)  REALMODE_STR2(x)
+
 /* 16-битный станок. Вход выполняется дальним переходом из 32-битного кода,
- * при этом база CS равна 0, а страницы уже выключены. Станок сам снимает
+ * при этом база CS равна REALMODE_CODE16_BASE, а страницы уже выключены.
+ * База выбрана по правилу реального режима (sel * 16), поэтому возврат
+ * BIOS из INT 10h командой iret попадает точно на следующую команду.
+ * Станок сам снимает
  * бит PE, то есть переходит в реальный режим, выполняет INT 10h по образу
  * регистров и возвращается в ядро дальним переходом через указатель
  * в рабочей странице. Все команды стандартны для i686, байты собраны
@@ -90,19 +105,19 @@ struct realmode_farptr {
 
 /* Запись временного GDT: 8 байт в стандартном порядке:
  * предел 16 бит, база 16 бит, база 8 бит, права, байт гранулярности,
- * база 8 бит. База у всех записей нулевая, различаются только предел,
- * гранулярность и тип сегмента. */
-static void realmode_gdt_entry(int index, uint32_t limit, uint8_t access, uint8_t gran) {
+ * база 8 бит. Базу задает вызывающий: у сегментов данных она нулевая,
+ * у кода 16 бит равна REALMODE_CODE16_BASE. */
+static void realmode_gdt_entry(int index, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran) {
     uint8_t* e = (uint8_t*)(uintptr_t)(REALMODE_SCRATCH + REALMODE_GDT_OFF + index * 8);
 
     e[0] = (uint8_t)(limit & 0xFF);
     e[1] = (uint8_t)((limit >> 8) & 0xFF);
-    e[2] = 0;                                  /* база, младшие 16 бит */
-    e[3] = 0;
-    e[4] = 0;                                  /* база, средний байт */
+    e[2] = (uint8_t)(base & 0xFF);             /* база, младшие 16 бит */
+    e[3] = (uint8_t)((base >> 8) & 0xFF);
+    e[4] = (uint8_t)((base >> 16) & 0xFF);     /* база, средний байт */
     e[5] = access;
     e[6] = (uint8_t)(((limit >> 16) & 0x0F) | (gran & 0xF0));
-    e[7] = 0;                                  /* база, старший байт */
+    e[7] = (uint8_t)((base >> 24) & 0xFF);     /* база, старший байт */
 }
 
 /* Подготовить рабочую страницу: скопировать станок, собрать временный GDT
@@ -112,11 +127,12 @@ static void realmode_scratch_prepare(void) {
            realmode_stub, sizeof(realmode_stub));
 
     /* Предел 16-битных сегментов равен 1 МБ (0xFFFFF) при бйтовой гранулярности,
-     * ровно как у LINUX и Limine: за это границу реальный режим не видит. */
-    realmode_gdt_entry(0, 0, 0, 0);                                  /* null */
-    realmode_gdt_entry(REALMODE_SEL_CODE16 / 8, 0xFFFFF, 0x9A, 0x00);    /* код 16 бит */
-    realmode_gdt_entry(REALMODE_SEL_DATA16 / 8, 0xFFFFF, 0x92, 0x00);    /* данные 16 бит */
-    realmode_gdt_entry(REALMODE_SEL_CODE32 / 8, 0xFFFFFFFF, 0x9A, 0xCF); /* код 32 бита */
+     * ровно как у LINUX и Limine: за это границу реальный режим не видит.
+     * База кода 16 бит не нулевая: реальный режим считает базу как sel * 16. */
+    realmode_gdt_entry(0, 0, 0, 0, 0);                                       /* null */
+    realmode_gdt_entry(REALMODE_SEL_CODE16 / 8, REALMODE_CODE16_BASE, 0xFFFFF, 0x9A, 0x00);  /* код 16 бит */
+    realmode_gdt_entry(REALMODE_SEL_DATA16 / 8, 0, 0xFFFFF, 0x92, 0x00);     /* данные 16 бит */
+    realmode_gdt_entry(REALMODE_SEL_CODE32 / 8, 0, 0xFFFFFFFF, 0x9A, 0xCF);  /* код 32 бита */
 
     REALMODE_GDTR.limit = (uint16_t)(4 * 8 - 1);
     REALMODE_GDTR.base = REALMODE_SCRATCH + REALMODE_GDT_OFF;
@@ -167,6 +183,9 @@ void realmode_int10(struct realmode_regs* regs) {
         "mov %%ax, %%ds\n\t"
         "mov %%ax, %%es\n\t"
         "mov %%ax, %%ss\n\t"
+        /* Стек станка лежит в нижней памяти, стек ядра туда не достает:
+         * спасаем вершину стека ядра и вернем ее по возвращении. */
+        "movl %%esp, %[esp]\n\t"
         "movl $0x5000, %%esp\n\t"
         "leal 1f, %%eax\n\t"                      /* адрес возврата станка */
         "movl %%eax, %[far1off]\n\t"
@@ -174,16 +193,20 @@ void realmode_int10(struct realmode_regs* regs) {
         "leal 2f, %%eax\n\t"                      /* адрес возврата в ядро */
         "movl %%eax, %[far2off]\n\t"
         "movw %[selk], %[far2sel]\n\t"             /* селектор кода ядра */
-        "ljmp $8, $0x7500\n\t"                    /* уход в 16-битный станок */
+        "ljmp $" REALMODE_STR(REALMODE_SEL_CODE16) ", $" REALMODE_STR(REALMODE_STUB_ENTER) "\n\t" /* уход в 16-битный станок */
         "1:\n\t"
         /* Станок вернулся: PE снова включен, страницы еще выключены. */
+        "mov %[esp], %%esp\n\t"                    /* вернуть стек ядра */
         "lgdt %[sgdt]\n\t"                        /* вернуть GDTR ядра */
-        "mov %[cr0], %%eax\n\t"
-        "movl %%eax, %%cr0\n\t"                   /* вернуть состояние страниц */
-        "mov %[cr3], %%eax\n\t"
-        "movl %%eax, %%cr3\n\t"                    /* вернуть каталог страниц */
+        /* Порядок обязателен: CR4 и CR3 ставятся до включения страниц
+         * в CR0, иначе первая же выборка команды пойдет по пустому
+         * каталогу страниц (CR3 = 0 в этот момент). */
         "mov %[cr4], %%eax\n\t"
         "movl %%eax, %%cr4\n\t"                    /* вернуть CR4 */
+        "mov %[cr3], %%eax\n\t"
+        "movl %%eax, %%cr3\n\t"                    /* вернуть каталог страниц */
+        "mov %[cr0], %%eax\n\t"
+        "movl %%eax, %%cr0\n\t"                   /* вернуть состояние страниц */
         "mov %[seld], %%ax\n\t"
         "mov %%ax, %%ds\n\t"
         "mov %%ax, %%es\n\t"
@@ -196,6 +219,7 @@ void realmode_int10(struct realmode_regs* regs) {
           [cr0] "m"(REALMODE_U32(REALMODE_CR0_OFF)),
           [cr3] "m"(REALMODE_U32(REALMODE_CR3_OFF)),
           [cr4] "m"(REALMODE_U32(REALMODE_CR4_OFF)),
+          [esp] "m"(REALMODE_U32(REALMODE_ESP_OFF)),
           [far1off] "m"(REALMODE_FAR1.offset),
           [far1sel] "m"(REALMODE_FAR1.selector),
           [far2off] "m"(REALMODE_FAR2.offset),

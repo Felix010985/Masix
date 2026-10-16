@@ -11,3 +11,7 @@
 #include <stdint.h>
 char keyboard_getc(void);
 void keyboard_init(void);
+
+/* Положить символ в очередь ввода консоли. Очередь одна на все источники:
+ * ее наполняет и обработчик клавиатуры (IRQ1), и приемник COM1 (IRQ4). */
+void keyboard_push_char(char c);

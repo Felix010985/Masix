@@ -15,6 +15,17 @@
 
 void serial_init(void);
 
+/* Начать принимать байты по COM1. Принятое прерыванием IRQ4 кладется в
+ * общую очередь ввода консоли, из которой читает keyboard_getc().
+ * Вызывать после pic_init(): до перенастройки PIC IRQ4 идет на другой вектор. */
+void serial_input_init(void);
+
+/* Есть ли уже принятый байт (опрос регистра состояния линии). */
+int serial_received(void);
+
+/* Прочитать один принятый байт. */
+char serial_getc(void);
+
 void serial_putc(char a);
 
 void serial_puts(const char* str);
