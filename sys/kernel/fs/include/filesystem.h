@@ -23,10 +23,10 @@
 extern unsigned char disk[DISK_SIZE];
 extern unsigned char block_bitmap[TOTAL_BLOCKS/8];
 
-int is_block_free(int index);
-void set_block_used(int index);
-void set_block_free(int index);
-int allocate_block(void);
+int fs_is_block_free(int index);
+void fs_set_block_used(int index);
+void fs_set_block_free(int index);
+int fs_allocate_block(void);
 
 typedef struct {
     char name[256];
@@ -50,3 +50,4 @@ int fs_read(int file_index, unsigned char* buffer, unsigned int size);
 #endif
 // честно я спросил chatgpt зачем надо первые 2 строки и он сказал для безопасности кода, оставлю так пока :)
 // это было 8 месяцев назад...
+int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsigned int size);

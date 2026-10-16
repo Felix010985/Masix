@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <kstat.h>
 
 #define VFS_FILE      1
 #define VFS_DIRECTORY 2
@@ -55,6 +56,26 @@ int32_t vfs_read(int fd, void *buf, uint32_t count);
 int32_t vfs_write(int fd, const void *buf, uint32_t count);
 
 typedef struct vfs_node vfs_node_t;
+
+/*
+ * Регистрация символьных устройств.
+ *
+ * Драйверы объявляют свои имена устройств и операции при инициализации.
+ * VFS и devtmpfs только смотрят эту таблицу и никогда не обращаются к
+ * символам драйвера напрямую: зависимость идет от драйвера к VFS,
+ * а не наоборот.
+ *
+ * Имя "console" зарезервировано: устройство, зарегистрировавшее его,
+ * обслуживает stdio (fd 0/1/2).
+ */
+typedef struct {
+    const char* name;
+    vfs_read_t  read;
+    vfs_write_t write;
+} vfs_device_t;
+
+void vfs_register_device(const vfs_device_t *dev);
+const vfs_device_t* vfs_lookup_device(const char *name);
 
 typedef struct {
     int32_t (*open)(const char *subpath, vfs_node_t *node);

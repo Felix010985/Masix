@@ -15,8 +15,6 @@ clion/*
 cmake-build-debug/*
 .idea/*
 include/libc.h
-world/musl/*
-world/sysroot/
 compile_and_run.sh
 tools/*
 !tools/*.c
@@ -28,3 +26,7 @@ kernel.c
 release.sh
 
 build/
+
+# Сгенерировано tools/configure
+config.mk
+sys/kernel/include/build_config.h

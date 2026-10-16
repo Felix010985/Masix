@@ -31,6 +31,19 @@ void* memcpy(void* dst, const void* src, unsigned int n) {
     return dst;
 }
 
+void* memmove(void* dst, const void* src, unsigned int n) {
+    unsigned char* d = dst;
+    const unsigned char* s = src;
+    if (d < s) {
+        /* Копирование вперед: области не перекрываются "задом наперед" */
+        for (unsigned int i = 0; i < n; i++) d[i] = s[i];
+    } else if (d > s) {
+        /* Копирование с конца: области перекрываются, так безопасно */
+        for (unsigned int i = n; i > 0; i--) d[i - 1] = s[i - 1];
+    }
+    return dst;
+}
+
 int strncmp(const char *s1, const char *s2, register size_t n) {
     register unsigned char u1, u2;
 
@@ -179,28 +192,29 @@ void print_num(int n) {
     print_str(buf);
 }
 
-static void internal_kernel_read_line(char* buf, int max_len) {
-    int read_bytes = 0;
-    while (read_bytes < max_len - 1) {
-        char c = keyboard_getc();
-        if (c == '\n' || c == '\r') {
-            buf[read_bytes++] = '\n';
-            tty_write_char('\n');
-            break;
-        } else if (c == '\b') {
-            if (read_bytes > 0) {
-                read_bytes--;
-                tty_write_char('\b');
-            }
-        } else {
-            buf[read_bytes++] = c;
-            tty_write_char(c);
-        }
-    }
-    buf[read_bytes] = '\0';
-}
+// я найду и убью того кто это блять сделал ебень тупой блять
+// static void internal_kernel_read_line(char* buf, int max_len) {
+//     int read_bytes = 0;
+//     while (read_bytes < max_len - 1) {
+//         char c = keyboard_getc();
+//         if (c == '\n' || c == '\r') {
+//             buf[read_bytes++] = '\n';
+//             tty_write_char('\n');
+//             break;
+//         } else if (c == '\b') {
+//             if (read_bytes > 0) {
+//                 read_bytes--;
+//                 tty_write_char('\b');
+//             }
+//         } else {
+//             buf[read_bytes++] = c;
+//             tty_write_char(c);
+//         }
+//     }
+//     buf[read_bytes] = '\0';
+// }
 
-void printf(const char* fmt, ...) {
+void vprintf(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
@@ -234,9 +248,16 @@ void printf(const char* fmt, ...) {
     va_end(args);
 }
 
+void printf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
+
 int scanf(const char *fmt, ...) {
     char buffer[MAX_INPUT];
-    internal_kernel_read_line(buffer, MAX_INPUT);
+    //internal_kernel_read_line(buffer, MAX_INPUT);
 
     const char *p = buffer;
     va_list args;
@@ -314,7 +335,7 @@ char *fgets(char *buf, int size, void *unused_stream) {
     (void)unused_stream;
     if (!buf || size <= 0) return NULL;
 
-    internal_kernel_read_line(buf, size);
+    //internal_kernel_read_line(buf, size);
 
     for (int i = 0; i < size; i++) {
         if (buf[i] == '\n' || buf[i] == '\r') {

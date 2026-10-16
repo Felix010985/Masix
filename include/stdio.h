@@ -1,4 +1,3 @@
-#include <api.h>
 #include <drivers/vga.h>
 #include <stdarg.h>
 

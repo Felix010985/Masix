@@ -18,7 +18,10 @@ struct exception_registers {
     uint32_t int_no, error_code;
     uint32_t eip, cs, eflags;
 };
-void kernel_exception_handler(struct exception_registers* regs);
+void panic_exception_handler(struct exception_registers* regs);
 void panic(const char* msg);
 
 #endif
+void panic_exception_gpf(void);
+void panic_exception_div_zero(void);
+void panic_exception_pf(void);

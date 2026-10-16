@@ -12,14 +12,21 @@
 #include <syscall.h>
 #include <vfs.h>
 #include <task.h>
-#include <api.h>
 #include <string.h>
-
-extern void idt_register_handler(uint8_t vector, uint32_t handler_addr, uint8_t flags);
-extern void itoa(int value, char* str, int base);
-extern void puts_com1(const char* s);
+#include <stdio.h>
+#include <idt.h>
+#include <config.h>
+#include <uapi.h>
+#include <linux/printk.h>
 
 uint32_t syscall_handler_c(struct syscall_regs* regs) {
+    {
+        char b[16];
+        itoa(regs->eax, b, 10);
+        debug_puts("Masix: SYS enter: ");
+        debug_puts(b);
+        debug_puts("\n");
+    }
     switch (regs->eax) {
 
         case MASIX_EXIT:
@@ -30,10 +37,10 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_READ:
-            return k_sys_read((int)regs->ebx, (char*)regs->ecx, regs->edx);
+            return sys_read((int)regs->ebx, (char*)regs->ecx, regs->edx);
 
         case MASIX_WRITE:
-            return k_sys_write(regs->ebx, (const char*)regs->ecx, regs->edx);
+            return sys_write(regs->ebx, (const char*)regs->ecx, regs->edx);
 
         case MASIX_PIPE:
         case MASIX_PIPE2:
@@ -41,9 +48,9 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
         case MASIX_SOCKETCALL:
         {
-            uint32_t *args = (uint32_t*)regs->ebx;
+            uint32_t *args = (uint32_t*)regs->ecx;
             if (!args) return -14;
-            switch (regs->ecx) {
+            switch (regs->ebx) {
                 case 1: return vfs_socket(args[0], args[1], args[2]);
                 case 2: return vfs_socket_bind(args[0], (const void*)args[1], args[2]);
                 case 3: return vfs_socket_connect(args[0], (const void*)args[1], args[2]);
@@ -58,22 +65,12 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_BRK:
-        {
-            uint32_t new_brk = regs->ebx;
-
-            if (new_brk == 0) {
-                return current_task->brk;
-            }
-
-            if (new_brk >= current_task->brk) {
-                current_task->brk = new_brk;
-            }
-            return current_task->brk;
-        }
+            return sys_brk(regs->ebx);
 
         case MASIX_FORK:
         {
             extern int32_t task_fork(struct syscall_regs* regs);
+            debug_puts("Masix: sys_fork\n");
             return task_fork(regs);
         }
 
@@ -92,6 +89,10 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
             uint32_t entry_number = user_desc[0];
             uint32_t base_addr    = user_desc[1];
+
+            { extern void itoa(int value, char* str, int base); char b[16];
+              debug_puts("set_thread_area: entry="); itoa((int)entry_number,b,16); debug_puts(b);
+              debug_puts(" base=0x"); itoa((int)base_addr,b,16); debug_puts(b); debug_puts("\n"); }
 
             extern void gdt_set_entry(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
             gdt_set_entry(entry_number, base_addr, 0xFFFFF, 0xF2, 0xCF);
@@ -115,7 +116,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             for (int i = 0; i < iovcnt; i++) {
                 if (iov[i].iov_base != NULL && iov[i].iov_len > 0) {
 
-                    int32_t ret = k_sys_write(fd, (const char*)iov[i].iov_base, iov[i].iov_len);
+                    int32_t ret = sys_write(fd, (const char*)iov[i].iov_base, iov[i].iov_len);
 
                     if (ret < 0) return ret;
                     total_written += ret;
@@ -138,7 +139,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_IOCTL:
-            return -LINUX_ENOSYS;
+            return sys_ioctl(regs->ebx, regs->ecx, (void*)regs->edx);
 
         case MASIX_GETPID:
             return current_task->pid;
@@ -164,7 +165,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
         case MASIX_EXIT_GROUP:
         {
-            puts_com1("Masix: SYS: Process called exit_group. Cleaning up...\n");
+            debug_puts("Masix: SYS: Process called exit_group. Cleaning up...\n");
 
             task_destroy();
 
@@ -196,26 +197,20 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_FSTAT:
-            return -LINUX_ENOSYS;
+            return sys_fstat(regs->ebx, (struct kstat*)regs->ecx);
 
         case MASIX_WAIT4:
-            return -LINUX_ENOSYS;
+            return sys_wait4((int)regs->ebx, (int*)regs->ecx, (int)regs->edx, (void*)regs->esi);
 
         case MASIX_RT_SIGACTION:
-        case MASIX_TKILL:
             return -LINUX_ENOSYS;
 
+        case MASIX_TKILL:
+        case MASIX_TGKILL:
+            return 0; /* Сигналов в ядре пока нет - считаем доставленным */
+
         case MASIX_MMAP2:
-        {
-            uint32_t length = regs->ecx;
-
-            uint32_t aligned_len = (length + 4095) & ~4095;
-
-            uint32_t allocated_addr = current_task->brk;
-            current_task->brk += aligned_len;
-
-            return allocated_addr;
-        }
+            return sys_mmap2(regs->ebx, regs->ecx, regs->edx, regs->esi, (int)regs->edi, regs->ebp);
 
         case MASIX_CLOSE:
             return vfs_close(regs->ebx);
@@ -234,25 +229,60 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_FCNTL64:
-        case MASIX_UGETRLIMIT:
-        case MASIX_GETDENTS:
-        case MASIX_STAT64:
-        case MASIX_FSTAT64:
-        case MASIX_FSTAT64_ALT:
-        case MASIX_NANOSLEEP:
-        case MASIX_CLOCK_GETTIME64:
         case MASIX_PRLIMIT64:
         case MASIX_STATX:
         case MASIX_PSELECT6:
             return -LINUX_ENOSYS;
 
+        case MASIX_UGETRLIMIT:
+        case MASIX_GETRLIMIT:
+            return sys_getrlimit((int)regs->ebx, (void*)regs->ecx);
+
+
+        case MASIX_GETDENTS:
+        case MASIX_GETDENTS64:
+            return sys_getdents64(regs->ebx, (void*)regs->ecx, regs->edx);
+
+        case MASIX_STAT64:
+            return sys_fstatat(-100 /* AT_FDCWD */, (const char*)regs->ebx,
+                               (struct kstat*)regs->ecx, 0);
+
+        case MASIX_FSTAT64:
+            return sys_fstat64(regs->ebx, (struct kstat*)regs->ecx);
+
+        case MASIX_FSTAT64_ALT:
+            return sys_fstat64(regs->ebx, (struct kstat*)regs->ecx);
+
+        case MASIX_FSTATAT64:
+            return sys_fstatat((int)regs->ebx, (const char*)regs->ecx,
+                               (struct kstat*)regs->edx, (int)regs->esi);
+
+        case MASIX_NANOSLEEP:
+        case MASIX_CLOCK_NANOSLEEP_TIME32:
+            return sys_nanosleep((const void*)regs->ebx, (void*)regs->ecx);
+
+
+        case MASIX_CLOCK_GETTIME32:
+            return sys_clock_gettime32((int)regs->ebx, (void*)regs->ecx);
+
+
+        case MASIX_CLOCK_GETTIME64:
+            return sys_clock_gettime64((int)regs->ebx, (void*)regs->ecx);
+
+
         case MASIX_GETUID:
         case MASIX_GETEUID:
         case MASIX_GETGID:
-        case MASIX_GETGID32:
         case MASIX_GETEGID:
+        case MASIX_GETUID32:
+        case MASIX_GETGID32:
+        case MASIX_GETEUID32:
+        case MASIX_GETEGID32:
 
             return 0;
+
+        case MASIX_GETPPID:
+            return current_task->parent ? current_task->parent->pid : 0;
 
         case MASIX_POLL:
         {
@@ -330,9 +360,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             char stub_buf[16];
             itoa(regs->eax, stub_buf, 10);
 
-            puts_com1("Masix: SYS: Unimplemented Linux syscall requested: ");
-            puts_com1(stub_buf);
-            puts_com1("\n");
+            printk("Masix: SYS: Unimplemented Linux syscall requested: %s\n", stub_buf);
 
             return -LINUX_ENOSYS;
         }

@@ -1,9 +1,15 @@
 .SILENT:
 
+# Сгенерированная конфигурация (tools/configure). Значения здесь
+# ниже только значения по умолчанию, приоритет у config.mk
+-include config.mk
+
 CC      := clang
 LD      := ld.lld
 GRUB    := grub-mkrescue
 QEMU    := qemu-system-x86_64
+OBJCOPY ?= objcopy
+HOSTCC  ?= cc
 
 BUILD_DIR := build
 ISO_DIR   := $(BUILD_DIR)/iso
@@ -13,27 +19,35 @@ GRUB_DIR  := $(BOOT_DIR)/grub
 ROOTFS_SRC_DIR := $(BUILD_DIR)/rootfs
 INITRAMFS_IMG  := $(BUILD_DIR)/initramfs.cpio
 
-MUSL_DIR  := world/musl
-MUSL_SYSROOT := world/sysroot
-MUSL_INC  := -I$(MUSL_SYSROOT)/include
+BOOTSTRAP_DIR := bootstrap
 
-MUSL_BUILD_DIR := $(BUILD_DIR)/musl_obj
+# Образы ядра: ELF для multiboot2 и Limine, физический образ и bzImage
+# для протокола LINUX.
+KERNEL_ELF  := $(BUILD_DIR)/kernel.elf
+KERNEL_BIN  := $(BUILD_DIR)/kernel.bin
+KERNEL_BZ   := $(BUILD_DIR)/kernel.bzImage
+MKZ_TOOL    := $(BUILD_DIR)/tools/mkbzimage
 
-TARGET_FLAGS := -target i686-unknown-elf
+TARGET_FLAGS ?= -target i686-unknown-elf
+ARCH_CFLAGS  ?= -Isys/kernel/arch/x86/include -Isys/kernel/arch/x86/i686/include
+LINKER_SCRIPT ?= sys/kernel/arch/x86/i686/linker.ld
 
-SYS_CFLAGS  := $(TARGET_FLAGS) -Isys/kernel/arch/i686/include -Isys/kernel/include -Isys/kernel/drivers/include -Isys/kernel/fs/include -Iinclude -ffreestanding -nostdlib -fno-stack-protector -fno-pic -O0 -Wall -Wextra -MMD
-USER_CFLAGS := $(TARGET_FLAGS) -Iworld $(MUSL_INC) -nostdinc -ffreestanding -mno-sse -mno-sse2 -fno-stack-protector -fno-pic -Os -ffunction-sections -fdata-sections -Wall -Wextra -MMD
+SYS_CFLAGS  := $(TARGET_FLAGS) -Isys/linuxkpi/include $(ARCH_CFLAGS) -Isys/kernel/include -Isys/kernel/drivers/include -Isys/tty/include -Isys/kernel/fs/include -Iinclude -ffreestanding -nostdlib -fno-stack-protector -fno-pic -O0 -g -Wall -Wextra -MMD
+# Юзерленд bootstrap: свободностоящий, без libc и субмодулей.
+# Все системные вызовы, напрямую через int 0x80 (bootstrap/src/syscall.h).
+BOOT_CFLAGS  := $(TARGET_FLAGS) -I$(BOOTSTRAP_DIR)/src -nostdinc -ffreestanding -mno-sse -mno-sse2 -fno-stack-protector -fno-pic -static -Os -ffunction-sections -fdata-sections -Wall -Wextra -MMD
+BOOT_LDFLAGS := -nostdlib -static -Wl,-Ttext=0x02000000 -Wl,--gc-sections -Wl,-s
 
-LDFLAGS := -m elf_i386 -T linker.ld -n
+LDFLAGS ?= -m elf_i386 -T $(LINKER_SCRIPT) -n
 
-SYS_SRCS   := $(shell find sys -name '*.c' 2>/dev/null)
+SYS_SRCS   := $(shell find sys -name '*.c' 2>/dev/null | sort)
 SYS_OBJS   := $(SYS_SRCS:sys/%.c=$(BUILD_DIR)/sys/%.o)
 
-USER_SRCS  := $(shell find world -name '*.c' ! -path "world/musl/*" 2>/dev/null)
-USER_ELFS  := $(USER_SRCS:world/%.c=$(BUILD_DIR)/world/%.elf)
+BOOT_SRCS  := $(shell find $(BOOTSTRAP_DIR) -name '*.c' 2>/dev/null | sort)
+BOOT_ELFS  := $(BOOT_SRCS:$(BOOTSTRAP_DIR)/%.c=$(BUILD_DIR)/$(BOOTSTRAP_DIR)/%.elf)
 
 ALL_OBJS   := $(SYS_OBJS)
-DEP_FILES  := $(ALL_OBJS:%.o=%.d) $(USER_ELFS:%.elf=%.d)
+DEP_FILES  := $(ALL_OBJS:%.o=%.d) $(BOOT_ELFS:%.elf=%.d)
 
 CLR_RESET   := \033[0m
 CLR_GREEN   := \033[1;32m
@@ -48,38 +62,20 @@ STATUS_WARN := [$(CLR_YELLOW) WARN $(CLR_RESET)]
 STATUS_INFO := [$(CLR_CYAN) INFO $(CLR_RESET)]
 
 .PHONY: all
-all: $(BUILD_DIR)/kernel.elf world $(INITRAMFS_IMG)
-	printf "$(CLR_GREEN)==== Компиляция и линковка ядра и юзерленда успешно завершена! ====$(CLR_RESET)\n"
+all: $(KERNEL_ELF) $(KERNEL_BZ) bootstrap $(INITRAMFS_IMG)
+	printf "$(CLR_GREEN)==== Компиляция и линковка ядра и bootstrap успешно завершена! ====$(CLR_RESET)\n"
 
-.PHONY: world
-world: $(MUSL_SYSROOT)/lib/libc.a $(USER_ELFS)
-	printf "$(CLR_GREEN)==== Сборка юзерленда World успешно завершена! ====$(CLR_RESET)\n"
-
-$(MUSL_SYSROOT)/lib/libc.a:
-	printf "$(STATUS_INFO) Настройка musl libc...\n"
-	mkdir -p $(MUSL_BUILD_DIR)
-	cd $(MUSL_BUILD_DIR) && CC="$(CC)" AR="llvm-ar" RANLIB="llvm-ranlib" \
-		CFLAGS="$(TARGET_FLAGS) -O2 -mno-sse -mno-sse2 -fno-pic -fno-pie" \
-		../../$(MUSL_DIR)/configure \
-		--prefix= \
-		--target=i686-unknown-elf \
-		--disable-shared \
-		--enable-static > /dev/null 2>&1
-
-	printf "$(STATUS_OK) musl libc успешно настроена!\n"
-
-	$(MAKE) --no-print-directory -C $(MUSL_BUILD_DIR) -j$$(nproc) 2>&1 | \
-		sed -u -n 's/.* -o \([^ ]*\).*/\1/p' | \
-		xargs -I {} printf "\r$(STATUS_INFO) Компиляция libc: {}\033[K"
-	printf "\r\033[K"
-
-	$(MAKE) --no-print-directory -C $(MUSL_BUILD_DIR) DESTDIR=../../$(MUSL_SYSROOT) install > /dev/null 2>&1
-	rm -rf $(MUSL_BUILD_DIR)
-	printf "$(STATUS_OK) musl libc успешно скомпилирована!\n"
+.PHONY: bootstrap
+bootstrap: $(BOOT_ELFS)
+	printf "$(CLR_GREEN)==== Сборка bootstrap успешно завершена! ====$(CLR_RESET)\n"
 
 .PHONY: kernel
-kernel: $(BUILD_DIR)/kernel.elf
+kernel: $(KERNEL_ELF)
 	printf "$(CLR_GREEN)==== Сборка ядра Masix завершена ====$(CLR_RESET)\n"
+
+.PHONY: bzimage
+bzimage: $(KERNEL_BZ)
+	printf "$(CLR_GREEN)==== Сборка образа bzImage завершена ====$(CLR_RESET)\n"
 
 .PHONY: initramfs
 initramfs: $(INITRAMFS_IMG)
@@ -87,53 +83,71 @@ initramfs: $(INITRAMFS_IMG)
 
 .PHONY: iso
 iso: $(BUILD_DIR)/mazukios.iso
-	printf "$(CLR_GREEN)==== ISO-образ MazukiOS полностью готов к тестированию! ====$(CLR_RESET)\n"
+	printf "$(CLR_GREEN)==== ISO-образ Masix полностью готов к тестированию! ====$(CLR_RESET)\n"
 
 .PHONY: run
 run: iso
-	printf "$(CLR_MAGENTA)==== Запуск MazukiOS в QEMU ====$(CLR_RESET)\n"
+	printf "$(CLR_MAGENTA)==== Запуск Masix в QEMU ====$(CLR_RESET)\n"
 	$(QEMU) -cdrom $(BUILD_DIR)/mazukios.iso -m 256M -serial stdio -nic user,model=rtl8139 -no-reboot -no-shutdown
 
-$(BUILD_DIR)/mazukios.iso: $(BUILD_DIR)/kernel.elf $(INITRAMFS_IMG) $(GRUB_DIR)/grub.cfg
+$(BUILD_DIR)/mazukios.iso: $(KERNEL_ELF) $(KERNEL_BZ) $(INITRAMFS_IMG) $(GRUB_DIR)/grub.cfg
 	printf "$(STATUS_INFO) Создание ISO-образа с initramfs\n"
 	mkdir -p $(BOOT_DIR)
-	cp $(BUILD_DIR)/kernel.elf $(BOOT_DIR)/
+	cp $(KERNEL_ELF) $(BOOT_DIR)/
+	cp $(KERNEL_BZ) $(BOOT_DIR)/
 	cp $(INITRAMFS_IMG) $(BOOT_DIR)/
 	$(GRUB) -o $@ $(ISO_DIR) 2>/dev/null
 	printf "$(STATUS_OK) ISO успешно собран: $(CLR_GREEN)$@$(CLR_RESET)\n"
 
-$(BUILD_DIR)/kernel.elf: $(SYS_OBJS) linker.ld
+# Физический образ ядра: тот самый, что грузят загрузчики по адресу 1 МБ.
+$(KERNEL_BIN): $(KERNEL_ELF)
+	printf "$(STATUS_INFO) Извлечение физического образа ядра\n"
+	$(OBJCOPY) -O binary $< $@
+
+# Инструмент хоста для сборки bzImage.
+$(MKZ_TOOL): tools/mkbzimage.c
+	printf "$(STATUS_INFO) Сборка инструмента mkbzimage\n"
+	mkdir -p $(dir $@)
+	$(HOSTCC) -O2 -Wall -Wextra -o $@ $<
+
+# Образ для протокола загрузки LINUX (GRUB: linux, Limine: protocol: linux).
+$(KERNEL_BZ): $(KERNEL_BIN) $(MKZ_TOOL)
+	printf "$(STATUS_INFO) Сборка образа bzImage\n"
+	@entry=$$(nm $(KERNEL_ELF) | awk '$$3=="entry_start" {print $$1}'); \
+	if [ "$$entry" != "00100000" ]; then \
+		printf "$(CLR_RED)[FAIL]$(CLR_RESET) точка входа entry_start должна лежать по адресу 0x00100000 (получено 0x$$entry)\n"; \
+		exit 1; \
+	fi
+	$(MKZ_TOOL) $(KERNEL_BIN) $@
+
+$(BUILD_DIR)/kernel.elf: $(SYS_OBJS) $(LINKER_SCRIPT)
 	printf "$(STATUS_INFO) Линковка ядра Masix...\n"
 	mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) -o $@ $(SYS_OBJS)
 	printf "      $(CLR_GRAY)| Размер файла: $$(wc -c < $@) байт$(CLR_RESET)\n"
 
-$(BUILD_DIR)/world/%.elf: world/%.c
-	printf "$(STATUS_INFO) Линковка юзерленда с musl libc: $(CLR_CYAN)$<$(CLR_RESET) -> $@\n"
+# Bootstrap-бинарники: статические, без crt и libc,
+# входная точка: собственный _start из исходника.
+$(BUILD_DIR)/$(BOOTSTRAP_DIR)/%.elf: $(BOOTSTRAP_DIR)/%.c
+	printf "$(STATUS_INFO) Компиляция bootstrap: $(CLR_CYAN)$<$(CLR_RESET) -> $@\n"
 	mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -static -nostdlib -Wl,-Ttext=0x02000000 -Wl,--gc-sections -Wl,-s -o $@ \
-		$(MUSL_SYSROOT)/lib/crt1.o \
-		$(MUSL_SYSROOT)/lib/crti.o \
-		$< \
-		-L$(MUSL_SYSROOT)/lib -lc \
-		$(MUSL_SYSROOT)/lib/crtn.o \
-		-lgcc 2> $(BUILD_DIR)/tmp_user_err.log || ( \
-			printf "[$(CLR_RED)FAIL$(CLR_RESET)] CC (Userland) $<\n"; \
-			cat $(BUILD_DIR)/tmp_user_err.log; \
-			rm -f $(BUILD_DIR)/tmp_user_err.log; \
-			exit 1 \
-		)
-	WARN_COUNT=$$(grep -c "warning:" $(BUILD_DIR)/tmp_user_err.log || true); \
+	$(CC) $(BOOT_CFLAGS) $(BOOT_LDFLAGS) -o $@ $< 2> $(BUILD_DIR)/tmp_boot_err.log || ( \
+		printf "[$(CLR_RED)FAIL$(CLR_RESET)] CC (Bootstrap) $<\n"; \
+		cat $(BUILD_DIR)/tmp_boot_err.log; \
+		rm -f $(BUILD_DIR)/tmp_boot_err.log; \
+		exit 1 \
+	)
+	WARN_COUNT=$$(grep -c "warning:" $(BUILD_DIR)/tmp_boot_err.log || true); \
 	if [ $$WARN_COUNT -gt 0 ]; then \
-		printf "$(STATUS_WARN) CC (Userland) $(CLR_CYAN)$<$(CLR_RESET) -> $@ $(CLR_GRAY)(x$$WARN_COUNT warnings)$(CLR_RESET)\n"; \
-		grep "warning:" $(BUILD_DIR)/tmp_user_err.log | sed 's/^/      | /' | head -n 2; \
+		printf "$(STATUS_WARN) CC (Bootstrap) $(CLR_CYAN)$<$(CLR_RESET) -> $@ $(CLR_GRAY)(x$$WARN_COUNT warnings)$(CLR_RESET)\n"; \
+		grep "warning:" $(BUILD_DIR)/tmp_boot_err.log | sed 's/^/      | /' | head -n 2; \
 		if [ $$WARN_COUNT -gt 2 ]; then \
 			printf "      $(CLR_GRAY)... и еще $$(($$WARN_COUNT - 2)) свернуто$(CLR_RESET)\n"; \
 		fi; \
 	fi; \
-	rm -f $(BUILD_DIR)/tmp_user_err.log
+	rm -f $(BUILD_DIR)/tmp_boot_err.log
 
-$(INITRAMFS_IMG): $(USER_ELFS)
+$(INITRAMFS_IMG): $(BOOT_ELFS)
 	printf "$(STATUS_INFO) Упаковка initramfs в формат CPIO...\n"
 	mkdir -p $(ROOTFS_SRC_DIR)/bin
 	mkdir -p $(ROOTFS_SRC_DIR)/etc
@@ -141,19 +155,15 @@ $(INITRAMFS_IMG): $(USER_ELFS)
 	mkdir -p $(ROOTFS_SRC_DIR)/proc
 	mkdir -p $(ROOTFS_SRC_DIR)/sys
 
-	for elf in $(USER_ELFS); do \
+	for elf in $(BOOT_ELFS); do \
 		cp $$elf $(ROOTFS_SRC_DIR)/bin/$$(basename $$elf .elf); \
 	done
 
-	if [ ! -f $(ROOTFS_SRC_DIR)/bin/init ] && [ -f $(ROOTFS_SRC_DIR)/bin/shell ]; then \
-		cp $(ROOTFS_SRC_DIR)/bin/shell $(ROOTFS_SRC_DIR)/bin/init; \
+	if [ ! -f $(ROOTFS_SRC_DIR)/bin/init ] && [ -f $(ROOTFS_SRC_DIR)/bin/sh ]; then \
+		cp $(ROOTFS_SRC_DIR)/bin/sh $(ROOTFS_SRC_DIR)/bin/init; \
 	fi
 
-	if [ -f world/etc/motd ]; then \
-		cp world/etc/motd $(ROOTFS_SRC_DIR)/etc/motd; \
-	else \
-		echo "Welcome to MazukiOS!" > $(ROOTFS_SRC_DIR)/etc/motd; \
-	fi
+	echo "Welcome to Masix (kernel bootstrap)!" > $(ROOTFS_SRC_DIR)/etc/motd
 
 	cd $(ROOTFS_SRC_DIR) && find . | cpio -o -H newc > ../../$(INITRAMFS_IMG) 2>/dev/null
 	printf "      $(CLR_GRAY)| Размер initramfs: $$(wc -c < $(INITRAMFS_IMG)) байт$(CLR_RESET)\n"
@@ -177,29 +187,31 @@ $(BUILD_DIR)/sys/%.o: sys/%.c
 		fi; \
 	else \
 		printf "$(STATUS_OK) CC (Kernel)   $(CLR_CYAN)$<$(CLR_RESET) -> $@\n"; \
-	fi
+	fi; \
 	rm -f $(BUILD_DIR)/tmp_sys_err.log
 
 $(GRUB_DIR)/grub.cfg:
 	mkdir -p $(GRUB_DIR)
 	printf "$(STATUS_INFO) Генерация конфигурации GRUB...\n"
-	echo 'set timeout=0' > $@
-	@echo 'set default=0' >> $@
-	@echo 'set gfxmode=1024x768x32' >> $@
-	@echo 'set gfxpayload=keep' >> $@
+	echo 'set timeout=5' > $@
+	@echo 'set default=5' >> $@
 	@echo '' >> $@
-	@echo 'menuentry "MazukiOS (LiveCD)" {' >> $@
+	@echo 'menuentry "Masix (multiboot2)" {' >> $@
 	@echo '    multiboot2 /boot/kernel.elf' >> $@
 	@echo '    module2 /boot/initramfs.cpio initramfs' >> $@
 	@echo '    boot' >> $@
 	@echo '}' >> $@
+	@echo '' >> $@
+	@echo 'menuentry "Masix (linux protocol)" {' >> $@
+	@echo '    linux /boot/kernel.bzImage' >> $@
+	@echo '    initrd /boot/initramfs.cpio' >> $@
+	@echo '    boot' >> $@
+	@echo '}' >> $@
 
-.PHONY: clean
 .PHONY: clean
 clean:
 	printf "$(CLR_CYAN)==== Очистка рабочей директории build/ ====$(CLR_RESET)\n"
 	rm -rf $(BUILD_DIR)
-	rm -rf $(MUSL_SYSROOT)/lib
 
 
 -include $(DEP_FILES)

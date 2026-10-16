@@ -1,4 +1,4 @@
 #pragma once
 
-void system_shutdown(void);
-void shutdown_by_panic(void);
+void power_shutdown(void);
+void power_shutdown_by_panic(void);

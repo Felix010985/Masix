@@ -9,19 +9,19 @@
  */
 #include <drivers/pit.h>
 #include <drivers/io.h>
+#include <drivers/rtl8139.h>
+#include <idt.h>
 #include <task.h>
 #include <stdint.h>
 
-extern void network_poll(void);
+
 
 static volatile uint32_t system_ticks = 0;
 
-extern void idt_register_handler(uint8_t vector, uint32_t handler_addr, uint8_t flags);
-extern void write_tss(int num, uint16_t ss0, uint32_t esp0);
 
 void pit_handler_c(void) {
     system_ticks++;
-    network_poll();
+    rtl8139_poll();
 }
 
 __attribute__((naked)) void pit_handler_asm(void) {
@@ -34,29 +34,27 @@ __attribute__((naked)) void pit_handler_asm(void) {
 
         "call pit_handler_c \n\t"
 
+        /* Подтверждаем IRQ0 для PIC ДО task_schedule(): task_schedule() завершается
+         * naked iret и не возвращается, поэтому EOI после него
+         * никогда бы не выполнился. */
+        "mov $0x20, %al \n\t"
+        "outb %al, $0x20 \n\t"
+
+        /* Сохраняем ESP в task->esp (поле esp - смещение 8 в task_t:
+         * pid=0, brk=4, esp=8). Это адрес pusha-блока текущего
+         * прерывания: task_schedule() восстановит его через popa/iret,
+         * корректно возобновляя и прерванный код ядра (например,
+         * системный вызов, в работе которого сработал таймер). */
         "movl current_task, %eax \n\t"
-        "movl %esp, 4(%eax) \n\t"
+        "movl %esp, 8(%eax) \n\t"
 
-        "call schedule \n\t"
+        "call task_schedule \n\t"
 
-        "movl current_task, %eax \n\t"
-        "movl 4(%eax), %esp \n\t"
-
-        "movl 12(%eax), %ebx \n\t"
-        "addl $4096, %ebx \n\t"
-
-        "pushl %ebx \n\t"
-    "pushl $0x10 \n\t"
-    "pushl $5 \n\t"
-    "call write_tss \n\t"
-    "addl $12, %esp \n\t"
-
-    "mov $0x20, %al \n\t"
-    "outb %al, $0x20 \n\t"
-
-    "popa \n\t"
-
-    "iret \n\t"
+        /* Сюда управление не доходит: task_schedule() не возвращается.
+         * Возобновленная задача продолжает исполнение своим popa/iret. */
+        "1: \n\t"
+        "hlt \n\t"
+        "jmp 1b \n\t"
     );
 }
 
@@ -75,7 +73,7 @@ uint32_t pit_get_ticks(void) {
     return system_ticks;
 }
 
-void sleep(uint32_t ticks) {
+void pit_sleep(uint32_t ticks) {
     uint32_t target_ticks = system_ticks + ticks;
     while (system_ticks < target_ticks) {
         asm volatile("hlt");

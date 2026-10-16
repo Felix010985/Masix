@@ -1,10 +1,20 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Masix Kernel
+ * Copyright (C) 2026, FelixProfi. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License.
+ */
 #pragma once
 #include <stdint.h>
 
-static uint16_t cursor_x = 0;
-static uint16_t cursor_y = 0;
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
+
+extern uint16_t cursor_x;
+extern uint16_t cursor_y;
 
 typedef enum {
     VGA_BLACK = 0x0,
@@ -29,4 +39,5 @@ void vga_putc_color(char c, uint8_t color);
 void vga_putc(char c);
 void vga_update_cursor(void);
 void vga_clear(uint8_t color);
-void vga_bsod(const char* msg);
+void vga_scroll(uint8_t color);
+void vga_raw_putc(char c, uint8_t color);

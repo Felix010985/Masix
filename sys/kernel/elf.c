@@ -9,10 +9,13 @@
  */
 #include <stdint.h>
 #include <stddef.h>
-#include <drivers/serial.h>
+#include <config.h>
 #include <vmm.h>
 #include <pmm.h>
 #include <vfs.h>
+#include <elf.h>
+#include <string.h>
+#include <stdio.h>
 
 typedef struct {
     unsigned char e_ident[16];
@@ -44,9 +47,6 @@ typedef struct {
 
 #define PT_LOAD 1
 
-extern void* memcpy(void* dst, const void* src, unsigned int n);
-extern void* memset(void* dst, int value, unsigned int n);
-extern void printf(const char* fmt, ...);
 
 static int elf_header_valid(const Elf32_Ehdr* header, uint32_t file_size) {
     if (header->e_ident[0] != 0x7F || header->e_ident[1] != 'E' ||
@@ -61,13 +61,13 @@ void* elf_load_binary(uint32_t file_start) {
     Elf32_Ehdr* elf_header = (Elf32_Ehdr*)file_start;
 
     if (!elf_header_valid(elf_header, 0xFFFFFFFFU)) {
-        puts_com1("Masix: ELF: Invalid magic signature!\n");
+        debug_puts("Masix: ELF: Invalid magic signature!\n");
         return NULL;
     }
 
     /* Создаем новое независимое пространство виртуальной памяти для процесса */
     if (vmm_userspace_create() != 0) {
-        puts_com1("Masix: ELF: Failed to create user space page directory!\n");
+        debug_puts("Masix: ELF: Failed to create user space page directory!\n");
         return NULL;
     }
 
@@ -86,7 +86,7 @@ void* elf_load_binary(uint32_t file_start) {
             for (uint32_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
                 uint32_t phys = pmm_alloc_zeroed();
                 if (!phys) {
-                    puts_com1("Masix: ELF: Out of physical memory!\n");
+                    debug_puts("Masix: ELF: Out of physical memory!\n");
                     return NULL;
                 }
                 // Мапим виртуальный адрес на выделенную физическую страницу
@@ -133,9 +133,10 @@ void* elf_load_node(vfs_node_t* node) {
         Elf32_Phdr phdr;
         uint32_t offset = header.e_phoff + (uint32_t)i * sizeof(phdr);
         if (node->read(node, offset, sizeof(phdr), (uint8_t*)&phdr) != sizeof(phdr)) goto fail;
-        if (phdr.p_type != PT_LOAD || phdr.p_memsz < phdr.p_filesz ||
+        if (phdr.p_type != PT_LOAD) continue;
+        if (phdr.p_memsz < phdr.p_filesz ||
             phdr.p_offset > node->size || phdr.p_filesz > node->size - phdr.p_offset ||
-            phdr.p_vaddr >= USER_TOP || phdr.p_memsz > USER_TOP - phdr.p_vaddr) goto fail;
+            phdr.p_vaddr >= USER_TOP || phdr.p_memsz > USER_TOP - phdr.p_vaddr) { debug_puts("Masix: ELF: bad phdr bounds\n"); goto fail; }
 
         uint32_t page_start = phdr.p_vaddr & ~(PAGE_SIZE - 1);
         uint32_t page_end = (phdr.p_vaddr + phdr.p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);

@@ -1,4 +1,5 @@
 void* memcpy(void* dst, const void* src, unsigned int n);
+void* memmove(void* dst, const void* src, unsigned int n);
 void* memset(void* dst, int value, unsigned int n);
 int strncmp(const char *s1, const char *s2, register size_t n);
 char* strncat(char* dst, const char* src, size_t n);
@@ -9,3 +10,7 @@ char* strcpy(char* dst, const char* src);
 int strcmp(const char* a, const char* b);
 void itoa(int value, char* str, int base);
 int atoi(const char* str);
+char* strchr(const char* s, int c);
+char* strrchr(const char* s, int c);
+char* strdup(const char* s);
+char* strcat(char* dst, const char* src);

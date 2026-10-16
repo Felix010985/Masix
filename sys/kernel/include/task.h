@@ -28,6 +28,9 @@ typedef struct task {
     uint8_t* kernel_stack;
     uint8_t* user_stack;
     struct task* next;
+    struct task* parent;
+    int dead_child_pid;
+    int dead_child_status;
     char cwd[MAX_PATH];
 } task_t;
 
@@ -36,9 +39,11 @@ void task_create(void* entry_point);
 int32_t task_fork(struct syscall_regs* regs);
 int32_t task_execve(const char* path, const char* const* argv,
                     const char* const* envp, struct syscall_regs* regs);
-void schedule(void);
+void task_schedule(void);
 void task_destroy(void);
 
 extern task_t* current_task;
+extern task_t* task_list_head;
 
 #endif
+

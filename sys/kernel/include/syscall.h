@@ -24,12 +24,11 @@
 #define MASIX_GETPID          20
 #define MASIX_MOUNT           21
 #define MASIX_PIPE            42
-#define MASIX_GETGID          64
 #define MASIX_BRK             45
 #define MASIX_IOCTL           54
 #define MASIX_FCNTL           55
 #define MASIX_DUP2            63
-#define MASIX_GETDENTS        78
+#define MASIX_GETPPID         64
 #define MASIX_MUNMAP          91
 #define MASIX_SOCKETCALL      102
 #define MASIX_FSTAT           108
@@ -37,6 +36,7 @@
 #define MASIX_MODIFY_LDT      123
 #define MASIX_GETPGID         132
 #define MASIX__LLSEEK         140
+#define MASIX_GETDENTS        141
 #define MASIX_WRITEV          146
 #define MASIX_FSTAT64_ALT     147
 #define MASIX_NANOSLEEP       162
@@ -49,10 +49,14 @@
 #define MASIX_STAT64          195
 #define MASIX_FCNTL64         221
 #define MASIX_FSTAT64         197
-#define MASIX_GETUID          199
+#define MASIX_GETUID          24
+#define MASIX_GETGID          47
+#define MASIX_GETEUID         49
+#define MASIX_GETEGID         50
+#define MASIX_GETUID32        199
 #define MASIX_GETGID32        200
-#define MASIX_GETEGID         201
-#define MASIX_GETEUID         202
+#define MASIX_GETEUID32       201
+#define MASIX_GETEGID32       202
 #define MASIX_TKILL           238
 #define MASIX_SET_THREAD_AREA 243
 #define MASIX_EXIT_GROUP      252
@@ -76,3 +80,15 @@ struct syscall_regs {
 
 uint32_t syscall_handler_c(struct syscall_regs *regs);
 void syscall_init(void);
+
+#define MASIX_GETRLIMIT            76
+#define MASIX_CLOCK_GETTIME32      265
+#define MASIX_CLOCK_NANOSLEEP_TIME32 267
+#define MASIX_GETDENTS64           220
+#define MASIX_FSTATAT64            300
+#define MASIX_TGKILL               270
+
+#define AT_FDCWD                   (-100)
+#define AT_EMPTY_PATH              0x1000
+#define WNOHANG                    1
+#define ECHILD                     10

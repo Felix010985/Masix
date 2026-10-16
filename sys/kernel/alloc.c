@@ -75,3 +75,11 @@ void alloc_free(void* ptr) {
         }
     }
 }
+
+void* malloc(size_t size) {
+    return alloc(size);
+}
+
+void free(void* ptr) {
+    alloc_free(ptr);
+}

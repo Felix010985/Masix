@@ -8,6 +8,7 @@
  * the Free Software Foundation; version 2 of the License.
  */
 #include <drivers/keyboard.h>
+#include <idt.h>
 #include <drivers/io.h>
 #include <stdint.h>
 
@@ -37,7 +38,7 @@ static const char scancode_shift_table[128] = {
     '*',0,' ',0,
 };
 
-static void kbd_push(char c) {
+static void keyboard_push(char c) {
     int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
     if (next != kbd_tail) {
         kbd_buffer[kbd_head] = c;
@@ -61,7 +62,7 @@ void keyboard_handler_c(void) {
 
         char c = shift ? scancode_shift_table[sc] : scancode_table[sc];
         if (c) {
-            kbd_push(c);
+            keyboard_push(c);
         }
     }
 }
@@ -78,7 +79,6 @@ char keyboard_getc(void) {
 }
 
 
-extern void idt_register_handler(uint8_t vector, uint32_t handler_addr, uint8_t flags);
 
 __attribute__((naked)) void keyboard_handler_asm(void) {
     __asm__ __volatile__ (

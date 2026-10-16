@@ -17,22 +17,22 @@
 unsigned char disk[DISK_SIZE];
 unsigned char block_bitmap[TOTAL_BLOCKS/8];
 
-int is_block_free(int index) {
+int fs_is_block_free(int index) {
     return !(block_bitmap[index / 8] & (1 << (index % 8)));
 }
 
-void set_block_used(int index) {
+void fs_set_block_used(int index) {
     block_bitmap[index / 8] |= (1 << (index % 8));
 }
 
-void set_block_free(int index) {
+void fs_set_block_free(int index) {
     block_bitmap[index / 8] &= ~(1 << (index % 8));
 }
 
-int allocate_block() {
+int fs_allocate_block() {
     for (int i = 0; i < TOTAL_BLOCKS; i++) {
-        if (is_block_free(i)) {
-            set_block_used(i);
+        if (fs_is_block_free(i)) {
+            fs_set_block_used(i);
             return i;
         }
     }
@@ -46,6 +46,9 @@ int fs_create(const char* name) {
 }
 
 int fs_create_type(const char* name, unsigned int type) {
+    if (!name || name[0] == 0) return -1;
+    if (type != FS_REGULAR && type != FS_DIRECTORY) return -1;
+    for (unsigned l = 0; name[l]; l++) { if (l > 254) return -1; }
     for (int i = 0; i < MAX_FILES; i++) {
         if (!file_table[i].used) {
             file_table[i].used = 1;
@@ -70,21 +73,23 @@ void fs_attach_external(int index, const unsigned char *data, unsigned int size)
 }
 
 void fs_delete(int index) {
-    if (!file_table[index].used) return;
+    if (index < 0 || index >= MAX_FILES || !file_table[index].used) return;
     for (int i = 0; i < MAX_BLOCKS_PER_FILE; i++) {
         if (file_table[index].blocks[i] != -1)
-            set_block_free(file_table[index].blocks[i]);
+            fs_set_block_free(file_table[index].blocks[i]);
     }
     file_table[index].used = 0;
 }
 
 int fs_write(int file_index, const unsigned char* data, unsigned int size) {
+    if (file_index < 0 || file_index >= MAX_FILES || !file_table[file_index].used) return -22;
+    if (!data && size) return -14;
     FileEntry* f = &file_table[file_index];
     if (f->external_data) return -30;
     unsigned int written = 0;
     for (int i = 0; i < MAX_BLOCKS_PER_FILE && written < size; i++) {
         if (f->blocks[i] == -1) {
-            int block = allocate_block();
+            int block = fs_allocate_block();
             if (block == -1) return written;
             f->blocks[i] = block;
         }
@@ -98,6 +103,8 @@ int fs_write(int file_index, const unsigned char* data, unsigned int size) {
 }
 
 int fs_read_at(int file_index, unsigned int offset, unsigned char* buffer, unsigned int size) {
+    if (file_index < 0 || file_index >= MAX_FILES || !file_table[file_index].used) return -22;
+    if (!buffer && size) return -14;
     FileEntry* f = &file_table[file_index];
     if (offset >= f->size) return 0;
     if (size > f->size - offset) size = f->size - offset;

@@ -8,17 +8,14 @@
  * the Free Software Foundation; version 2 of the License.
  */
 #include <stdint.h>
+#include <drivers/io.h>
+#include <drivers/vga.h>
 
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
 
 uint16_t cursor_x = 0;
 uint16_t cursor_y = 0;
 volatile uint16_t* vga_buffer = (volatile uint16_t*)0xB8000;
 
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
 
 void vga_update_cursor(void) {
     uint16_t pos = cursor_y * VGA_WIDTH + cursor_x;
@@ -68,20 +65,3 @@ void vga_raw_putc(char c, uint8_t color) {
 void vga_putc(char c) {
     vga_raw_putc(c, 0x0F);
 }
-// вспомогательная функция для вывода BSOD сообщения
-// REFRACTOR: убран static, функция теперь объявлена в bsod.h
-void print_bsod_str(const char* s) {
-    uint8_t bsod_color = 0x1F;
-    while (*s) {
-        if (*s == '\n') {
-            cursor_x = 0;
-            cursor_y++;
-            if (cursor_y >= VGA_HEIGHT) vga_scroll(bsod_color);
-            vga_update_cursor();
-            s++;
-            continue;
-        }
-        vga_raw_putc(*s++, bsod_color);
-    }
-}
-

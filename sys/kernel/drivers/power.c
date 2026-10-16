@@ -8,12 +8,10 @@
  * the Free Software Foundation; version 2 of the License.
  */
 #include <stdint.h>
+#include <drivers/io.h>
 
-static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
 
-void system_shutdown(void) {
+void power_shutdown(void) {
     outw(0x604, 0x2000);
 
     // print("System halted\n", VGA_RED);
@@ -23,7 +21,7 @@ void system_shutdown(void) {
     }
 }
 
-void shutdown_by_panic() {
+void power_shutdown_by_panic() {
     __asm__ volatile ("cli");
     uint64_t idt_ptr = 0;
     __asm__ volatile ("lidt (%0)" : : "r"(&idt_ptr));
