@@ -3,6 +3,6 @@
 #define OS_DATA "Masix"
 
 static const char os_data[] = OS_DATA;
-static const char version_data[] = "Masix version 0.2.5_69";
+static const char version_data[] = "Masix version 3.0";
 
 #endif

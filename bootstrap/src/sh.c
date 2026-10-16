@@ -97,7 +97,7 @@ static void cmd_fork(void) {
     }
 }
 
-/* Пытается запустить /bin/<name> как отдельный процесс. */
+/* Пытаемся запустить /bin/<name> как отдельный процесс. */
 static void run_command(char* name, char** argv) {
     char path[LINE_MAX];
 

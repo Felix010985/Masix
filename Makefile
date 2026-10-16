@@ -193,8 +193,8 @@ $(BUILD_DIR)/sys/%.o: sys/%.c
 $(GRUB_DIR)/grub.cfg:
 	mkdir -p $(GRUB_DIR)
 	printf "$(STATUS_INFO) Генерация конфигурации GRUB...\n"
-	echo 'set timeout=5' > $@
-	@echo 'set default=5' >> $@
+	echo 'set timeout=0' > $@
+	@echo 'set default=0' >> $@
 	@echo '' >> $@
 	@echo 'menuentry "Masix (multiboot2)" {' >> $@
 	@echo '    multiboot2 /boot/kernel.elf' >> $@
