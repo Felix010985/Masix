@@ -80,7 +80,6 @@ void initramfs_unpack(uint32_t archive_start, uint32_t archive_size) {
              * chdir("/") и разрешение путей в VFS не находят корень. */
 
             // тут точно где то есть баг, я просто не могу его найти
-            // ПОЧТИ НАШЕЛ и опять же чуть не угробил весь масикс
             if (strcmp(filename, ".") == 0) {
                 clean_path[0] = '/';
                 clean_path[1] = '\0';
