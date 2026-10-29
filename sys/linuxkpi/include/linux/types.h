@@ -11,6 +11,7 @@
 #define _LINUX_TYPES_H
 
 #include <stdint.h>
+#include <asm/posix_types.h>
 
 typedef uint8_t  __u8;
 typedef uint16_t __u16;
@@ -26,5 +27,16 @@ typedef __u16 __umode_t;
 typedef __u32 __kernel_pid_t;
 typedef __u32 __kernel_uid32_t;
 typedef __u32 __kernel_gid32_t;
+
+/* Экспортируем стандартные типы наружу для всего ядра Masix */
+#ifndef _SIZE_T_DEFINED
+#define _SIZE_T_DEFINED
+typedef __kernel_size_t size_t;
+#endif
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef __kernel_ssize_t ssize_t;
+#endif
 
 #endif

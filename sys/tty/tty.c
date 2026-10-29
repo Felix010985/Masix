@@ -12,39 +12,91 @@
 #include <string.h>
 #include <stdio.h>
 #include <vfs.h>
+#include <tty.h>
 #include <drivers/framebuffer.h>
 #include <drivers/vga.h>
 #include <drivers/keyboard.h>
-
 #include <fonts/default8x16.h>
 
 extern void vga_putc_color(char c, uint8_t color) __attribute__((weak));
 extern void vga_clear(uint8_t color) __attribute__((weak));
 
-static uint32_t tty_x = 0;
-static uint32_t tty_y = 0;
-
-static int cursor_enabled = 1;
-static int cursor_blinking = 1;
-static int cursor_state = 0;
-static int cursor_drawn = 0;
-
-static uint8_t tty_color = 0x07;
-
-static int ansi_state = 0;
-static int ansi_arg1 = 0;
-static int ansi_arg2 = 0;
-static int* ansi_current_arg = NULL;
-
-/* --- Редактирование строки ----------------------------------------
- * Редактирование на уровне ядра: эхо, backspace, буфер строки.
- * Читатель (шелл и любой другой) получает готовую строку.
+/* --- Виртуальные консоли ------------------------------------------
+ *
+ * Каждая консоль (tty1..tty6) держит собственный виртуальный экран -
+ * сетку ячеек «символ + атрибут VGA», как в текстовом режиме Linux.
+ * На физический экран содержимое попадает только у активной консоли,
+ * поэтому переключение (Alt+F1..F6) сводится к перерисовке сетки.
+ *
+ * Ввод тоже разделен: обработчик клавиатуры отдает символ только
+ * активной консоли. Поэтому getty на tty2 не перехватывает нажатия,
+ * предназначенные tty1, - в отличие от общей очереди, которая была
+ * тут раньше.
+ *
+ * "console"/"tty"/"tty0" - это текущая (активная) консоль, как в Linux,
+ * а "tty1".."tty6" - фиксированные.
  */
+
+#define TTY_COUNT       7                  /* ttys[0] не используется */
+#define TTY_FIRST       1
+#define TTY_LAST        (TTY_COUNT - 1)
+
+#define TTY_MAX_COLS    256
+#define TTY_MAX_ROWS    128
+
+/* Редактирование строки: эхо, backspace и буфер. Читатель (шелл и любой
+ * другой) получает готовую строку через tty_read(). */
 #define TTY_LINE_BUF_SIZE 256
-static char tty_line_buf[TTY_LINE_BUF_SIZE];
-static volatile uint32_t tty_line_len = 0;
-static volatile uint32_t tty_line_pos = 0;
-static volatile int tty_line_complete = 0;
+/* Необработанные нажатия от обработчика IRQ. */
+#define TTY_RAW_SIZE      256
+
+typedef struct {
+    /* Виртуальный экран: старший байт - атрибут VGA, младший - символ. */
+    uint16_t cells[TTY_MAX_ROWS * TTY_MAX_COLS];
+    uint32_t cols, rows;
+    uint32_t x, y;
+    uint8_t  color;
+
+    int cursor_enabled;
+    int cursor_drawn;
+
+    /* Разбор escape-последовательностей ANSI. */
+    int ansi_state;
+    int ansi_is_dec;
+    int ansi_arg1;
+    int ansi_arg2;
+    int ansi_which;      /* 0 - arg1, 1 - arg2 */
+
+    /* Нажатия, еще не разобранные читателем. Кольцо заполняет только
+     * обработчик IRQ, и только для активной консоли. */
+    char raw[TTY_RAW_SIZE];
+    volatile uint32_t raw_head;
+    volatile uint32_t raw_tail;
+
+    /* Собираемая строка канонического режима. */
+    char line_buf[TTY_LINE_BUF_SIZE];
+    uint32_t line_len;
+    uint32_t line_pos;
+
+    /* Готовая строка, выдаваемая читателю по частям. */
+    char deliver[TTY_LINE_BUF_SIZE];
+    uint32_t deliver_len;
+    uint32_t deliver_pos;
+} tty_t;
+
+static tty_t ttys[TTY_COUNT];
+static int tty_current = TTY_FIRST;
+static int tty_ready = 0;
+
+static void tty_putc(tty_t *t, char c);
+static void tty_backspace_t(tty_t *t);
+static void tty_erase_cursor_t(tty_t *t);
+static void tty_draw_cursor_t(tty_t *t);
+static void tty_sync_dims(tty_t *t);
+
+static tty_t *tty_active(void) {
+    return &ttys[tty_current];
+}
 
 /* --- Таблицы цветов ANSI ----------------------------------------- */
 static const uint8_t ansi_to_vga[16] = {
@@ -78,11 +130,39 @@ uint32_t tty_height(void) {
     return framebuffer_available() ? (framebuffer_height / FONT_HEIGHT) : VGA_HEIGHT;
 }
 
-/* --- Обработка курсора ------------------------------------------- */
+/* Подгоняем сетку консоли под текущий видеорежим. Вызывается лениво:
+ * tty_init() выполняется до framebuffer_init(), поэтому размеры
+ * становятся известны только к первому выводу. */
+static void tty_sync_dims(tty_t *t) {
+    uint32_t cols = tty_width();
+    uint32_t rows = tty_height();
+    if (cols > TTY_MAX_COLS) cols = TTY_MAX_COLS;
+    if (rows > TTY_MAX_ROWS) rows = TTY_MAX_ROWS;
+    if (cols == 0 || rows == 0) return;
+    if (cols == t->cols && rows == t->rows) return;
 
-static void tty_xor_cursor(void) {
-    uint32_t x_start = tty_x * FONT_WIDTH;
-    uint32_t y_start = tty_y * FONT_HEIGHT;
+    t->cols = cols;
+    t->rows = rows;
+    uint16_t blank = (uint16_t)((0x07 << 8) | ' ');
+    for (uint32_t i = 0; i < cols * rows; i++) t->cells[i] = blank;
+    t->x = 0;
+    t->y = 0;
+    t->cursor_drawn = 0;
+
+    if (t == tty_active()) {
+        if (framebuffer_available()) {
+            framebuffer_clear_color(tty_get_raw_color((0x07 >> 4) & 15));
+        } else if (vga_clear) {
+            vga_clear(0x07);
+        }
+    }
+}
+
+/* --- Курсор ------------------------------------------------------ */
+
+static void tty_xor_cursor(tty_t *t) {
+    uint32_t x_start = t->x * FONT_WIDTH;
+    uint32_t y_start = t->y * FONT_HEIGHT;
     uint32_t inv_mask = framebuffer_bpp == 16 ? 0xFFFF : 0xFFFFFF;
 
     for (uint32_t py = 0; py < FONT_HEIGHT; py++) {
@@ -103,21 +183,25 @@ static void tty_xor_cursor(void) {
     }
 }
 
-void tty_draw_cursor(void) {
-    if (!framebuffer_available() || !cursor_enabled) return;
-    if (cursor_drawn) return;
-    tty_xor_cursor();
-    cursor_drawn = 1;
+static void tty_draw_cursor_t(tty_t *t) {
+    if (t != tty_active() || !framebuffer_available() || !t->cursor_enabled) return;
+    if (t->cursor_drawn) return;
+    tty_xor_cursor(t);
+    t->cursor_drawn = 1;
 }
 
-void tty_erase_cursor(void) {
-    if (!framebuffer_available() || !cursor_enabled) return;
-    if (!cursor_drawn) return;
-    tty_xor_cursor();
-    cursor_drawn = 0;
+static void tty_erase_cursor_t(tty_t *t) {
+    if (t != tty_active() || !framebuffer_available() || !t->cursor_enabled) return;
+    if (!t->cursor_drawn) return;
+    tty_xor_cursor(t);
+    t->cursor_drawn = 0;
 }
 
-/* --- Отрисовка символов ------------------------------------------ */
+/* Публичные обертки работают с текущей консолью. */
+void tty_draw_cursor(void) { tty_draw_cursor_t(tty_active()); }
+void tty_erase_cursor(void) { tty_erase_cursor_t(tty_active()); }
+
+/* --- Отрисовка ячеек --------------------------------------------- */
 
 static void tty_draw_char_fb(uint32_t col, uint32_t row, char c, uint8_t color) {
     const uint8_t* glyph = &font_data[(uint8_t)c * FONT_HEIGHT];
@@ -136,253 +220,385 @@ static void tty_draw_char_fb(uint32_t col, uint32_t row, char c, uint8_t color) 
     }
 }
 
-static void tty_scroll(void) {
+/* Нарисовать одну ячейку на физическом экране - но только если эта
+ * консоль активна: фоновая пишет лишь в свою сетку. */
+static void tty_render_cell(tty_t *t, uint32_t col, uint32_t row) {
+    if (t != tty_active()) return;
+    if (col >= t->cols || row >= t->rows) return;
+
+    uint16_t cell = t->cells[row * t->cols + col];
+    char c = (char)(cell & 0xFF);
+    uint8_t attr = (uint8_t)(cell >> 8);
+
     if (framebuffer_available()) {
-        uint32_t font_height_pixels = FONT_HEIGHT;
-        uint32_t bytes_per_line = framebuffer_pitch;
-        uint32_t total_scroll_bytes = (framebuffer_height - font_height_pixels) * bytes_per_line;
-
-        memcpy((void*)framebuffer, (const void*)(framebuffer + font_height_pixels * bytes_per_line), total_scroll_bytes);
-
-        uint32_t bg_color = tty_get_raw_color((tty_color >> 4) & 15);
-        for (uint32_t y = framebuffer_height - font_height_pixels; y < framebuffer_height; y++) {
-            for (uint32_t x = 0; x < framebuffer_width; x++) {
-                framebuffer_put_pixel(x, y, bg_color);
-            }
-        }
-        tty_y = tty_height() - 1;
+        tty_draw_char_fb(col, row, c, attr);
+    } else if (col < VGA_WIDTH && row < VGA_HEIGHT) {
+        vga_buffer[row * VGA_WIDTH + col] = cell;
     }
 }
 
-static void tty_newline(void) {
-    tty_x = 0;
-    tty_y++;
-    if (tty_y >= tty_height()) tty_scroll();
+static void tty_store_cell(tty_t *t, uint32_t col, uint32_t row, char c, uint8_t attr) {
+    if (col >= t->cols || row >= t->rows) return;
+    t->cells[row * t->cols + col] = (uint16_t)(((uint16_t)attr << 8) | (uint8_t)c);
+    tty_render_cell(t, col, row);
+}
+
+/* Полная перерисовка: нужна после переключения консоли. */
+static void tty_render_all(tty_t *t) {
+    if (t != tty_active()) return;
+
+    if (framebuffer_available()) {
+        for (uint32_t row = 0; row < t->rows; row++) {
+            for (uint32_t col = 0; col < t->cols; col++) {
+                tty_render_cell(t, col, row);
+            }
+        }
+    } else {
+        for (uint32_t row = 0; row < t->rows && row < VGA_HEIGHT; row++) {
+            for (uint32_t col = 0; col < t->cols && col < VGA_WIDTH; col++) {
+                vga_buffer[row * VGA_WIDTH + col] = t->cells[row * t->cols + col];
+            }
+        }
+        cursor_x = (uint16_t)t->x;
+        cursor_y = (uint16_t)t->y;
+        vga_update_cursor();
+    }
+    t->cursor_drawn = 0;
+}
+
+static void tty_scroll(tty_t *t) {
+    uint32_t line = t->cols;
+
+    memmove(t->cells, t->cells + line, (t->rows - 1) * line * sizeof(uint16_t));
+    uint16_t blank = (uint16_t)(((uint16_t)t->color << 8) | ' ');
+    for (uint32_t i = (t->rows - 1) * line; i < t->rows * line; i++) t->cells[i] = blank;
+
+    if (t == tty_active()) {
+        if (framebuffer_available()) {
+            uint32_t bytes_per_line = framebuffer_pitch;
+            uint32_t total_scroll_bytes = (framebuffer_height - FONT_HEIGHT) * bytes_per_line;
+            memcpy((void*)framebuffer, (const void*)(framebuffer + FONT_HEIGHT * bytes_per_line), total_scroll_bytes);
+
+            uint32_t bg_color = tty_get_raw_color((t->color >> 4) & 15);
+            for (uint32_t y = framebuffer_height - FONT_HEIGHT; y < framebuffer_height; y++) {
+                for (uint32_t x = 0; x < framebuffer_width; x++) {
+                    framebuffer_put_pixel(x, y, bg_color);
+                }
+            }
+        } else {
+            for (uint32_t row = 0; row < t->rows && row < VGA_HEIGHT; row++) {
+                for (uint32_t col = 0; col < t->cols && col < VGA_WIDTH; col++) {
+                    vga_buffer[row * VGA_WIDTH + col] = t->cells[row * t->cols + col];
+                }
+            }
+        }
+    }
+
+    t->y = t->rows - 1;
+    t->cursor_drawn = 0;
+}
+
+static void tty_newline(tty_t *t) {
+    t->x = 0;
+    t->y++;
+    if (t->y >= t->rows) tty_scroll(t);
 }
 
 /* --- Парсер ANSI ------------------------------------------------- */
 
-static int tty_parse_ansi(char c) {
-    static int ansi_is_dec = 0;
-
-    if (ansi_state == 0) {
+static int tty_parse_ansi(tty_t *t, char c) {
+    if (t->ansi_state == 0) {
         if (c != '\033') return 0;
-        ansi_state = 1;
-        ansi_arg1 = 0;
-        ansi_arg2 = 0;
-        ansi_current_arg = &ansi_arg1;
-        ansi_is_dec = 0;
+        t->ansi_state = 1;
+        t->ansi_arg1 = 0;
+        t->ansi_arg2 = 0;
+        t->ansi_which = 0;
+        t->ansi_is_dec = 0;
         return 1;
     }
-    if (ansi_state == 1) {
-        ansi_state = c == '[' ? 2 : 0;
+    if (t->ansi_state == 1) {
+        t->ansi_state = c == '[' ? 2 : 0;
         return 1;
     }
-    if (ansi_state == 2) {
+    if (t->ansi_state == 2) {
         if (c == '?') {
-            ansi_is_dec = 1;
+            t->ansi_is_dec = 1;
             return 1;
         }
         if (c >= '0' && c <= '9') {
-            *ansi_current_arg = *ansi_current_arg * 10 + c - '0';
+            int *arg = t->ansi_which ? &t->ansi_arg2 : &t->ansi_arg1;
+            *arg = *arg * 10 + (c - '0');
             return 1;
         }
         if (c == ';') {
-            ansi_current_arg = &ansi_arg2;
+            t->ansi_which = 1;
             return 1;
         }
 
         /* Перед командами, которые двигают или стирают, убираем курсор,
          * иначе останется артефакт на старом месте экрана. */
-        tty_erase_cursor();
+        tty_erase_cursor_t(t);
 
-        if (c == 'J' && (ansi_arg1 == 0 || ansi_arg1 == 2)) {
-            if (framebuffer_available()) {
-                uint32_t bg_raw = tty_get_raw_color((tty_color >> 4) & 15);
-                framebuffer_clear_color(bg_raw);
-            } else {
-                if (vga_clear) vga_clear(tty_color);
+        if (c == 'J' && (t->ansi_arg1 == 0 || t->ansi_arg1 == 2)) {
+            uint16_t blank = (uint16_t)(((uint16_t)t->color << 8) | ' ');
+            for (uint32_t i = 0; i < t->cols * t->rows; i++) t->cells[i] = blank;
+            if (t == tty_active()) {
+                if (framebuffer_available()) {
+                    framebuffer_clear_color(tty_get_raw_color((t->color >> 4) & 15));
+                } else if (vga_clear) {
+                    vga_clear(t->color);
+                }
             }
-            tty_x = 0;
-            tty_y = 0;
+            t->x = 0;
+            t->y = 0;
+            t->cursor_drawn = 0;
         } else if (c == 'H' || c == 'f') {
-            uint32_t target_row = (ansi_arg1 > 0) ? ansi_arg1 - 1 : 0;
-            uint32_t target_col = (ansi_arg2 > 0) ? ansi_arg2 - 1 : 0;
-            if (target_row < tty_height()) tty_y = target_row;
-            if (target_col < tty_width()) tty_x = target_col;
+            uint32_t target_row = (t->ansi_arg1 > 0) ? (uint32_t)t->ansi_arg1 - 1 : 0;
+            uint32_t target_col = (t->ansi_arg2 > 0) ? (uint32_t)t->ansi_arg2 - 1 : 0;
+            if (target_row < t->rows) t->y = target_row;
+            if (target_col < t->cols) t->x = target_col;
         } else if (c == 'm') {
-            if (ansi_arg1 == 0) {
-                tty_color = 0x07;
-            } else if (ansi_arg1 >= 30 && ansi_arg1 <= 37) {
-                tty_color = (tty_color & 0xF0) | ansi_to_vga[ansi_arg1 - 30];
-            } else if (ansi_arg1 >= 90 && ansi_arg1 <= 97) {
-                tty_color = (tty_color & 0xF0) | ansi_to_vga[ansi_arg1 - 90 + 8];
+            if (t->ansi_arg1 == 0) {
+                t->color = 0x07;
+            } else if (t->ansi_arg1 >= 30 && t->ansi_arg1 <= 37) {
+                t->color = (t->color & 0xF0) | ansi_to_vga[t->ansi_arg1 - 30];
+            } else if (t->ansi_arg1 >= 90 && t->ansi_arg1 <= 97) {
+                t->color = (t->color & 0xF0) | ansi_to_vga[t->ansi_arg1 - 90 + 8];
             }
-            if (ansi_arg2 >= 30 && ansi_arg2 <= 37) {
-                tty_color = (tty_color & 0xF0) | ansi_to_vga[ansi_arg2 - 30];
+            if (t->ansi_arg2 >= 30 && t->ansi_arg2 <= 37) {
+                t->color = (t->color & 0xF0) | ansi_to_vga[t->ansi_arg2 - 30];
             }
+        } else if (c == 'h') {
+            if (t->ansi_is_dec && t->ansi_arg1 == 25) t->cursor_enabled = 1;
+        } else if (c == 'l') {
+            if (t->ansi_is_dec && t->ansi_arg1 == 25) t->cursor_enabled = 0;
         }
-        else if (c == 'h') {
-            if (ansi_is_dec && ansi_arg1 == 25) {
-                cursor_enabled = 1;
-            }
-        }
-        else if (c == 'l') {
-            if (ansi_is_dec && ansi_arg1 == 25) {
-                cursor_enabled = 0;
-            }
-        }
-        else if (c == 'q') {
-            if (ansi_arg1 == 1) {
-                cursor_blinking = 1;
-            } else if (ansi_arg1 == 2) {
-                cursor_blinking = 0;
-                cursor_state = 1;
-            }
-        }
+        /* Команда 'q' (мигание курсора) намеренно игнорируется: мигание
+         * требует таймера, которого у консоли пока нет. */
 
         /* После команды возвращаем курсор на место */
-        tty_draw_cursor();
-
-        ansi_state = 0;
+        tty_draw_cursor_t(t);
+        t->ansi_state = 0;
         return 1;
     }
-    ansi_state = 0;
+    t->ansi_state = 0;
     return 1;
 }
 
 /* --- Backspace --------------------------------------------------- */
 
-void tty_backspace(void) {
-    if (tty_x > 0) tty_x--;
-    else if (tty_y > 0) {
-        tty_y--;
-        tty_x = tty_width() - 1;
+static void tty_backspace_t(tty_t *t) {
+    if (t->x > 0) t->x--;
+    else if (t->y > 0) {
+        t->y--;
+        t->x = t->cols - 1;
     }
-    if (framebuffer_available()) {
-        tty_draw_char_fb(tty_x, tty_y, ' ', tty_color);
-    } else {
-        if (vga_putc_color) vga_putc_color('\b', tty_color);
-    }
+    tty_store_cell(t, t->x, t->y, ' ', t->color);
 }
 
 /* --- Вывод символов ---------------------------------------------- */
 
-void tty_write_char(char c) {
-    if (tty_parse_ansi(c)) return;
+static void tty_putc(tty_t *t, char c) {
+    if (tty_parse_ansi(t, c)) return;
 
-    if (framebuffer_available()) {
-        if (c == '\n') {
-            tty_erase_cursor();
-            tty_newline();
-            tty_draw_cursor();
-            return;
-        }
-        if (c == '\r') {
-            tty_erase_cursor();
-            tty_x = 0;
-            tty_draw_cursor();
-            return;
-        }
-        if (c == '\t') {
-            tty_erase_cursor();
-            do {
-                tty_draw_char_fb(tty_x, tty_y, ' ', tty_color);
-                tty_x++;
-                if (tty_x >= tty_width()) tty_newline();
-            } while (tty_x && (tty_x & 7));
-            tty_draw_cursor();
-            return;
-        }
-        if (c == '\b') {
-            tty_erase_cursor();
-            tty_backspace();
-            tty_draw_cursor();
-            return;
-        }
+    tty_sync_dims(t);
 
-        tty_erase_cursor();
-        tty_draw_char_fb(tty_x, tty_y, c, tty_color);
-        tty_x++;
-        if (tty_x >= tty_width()) tty_newline();
-        tty_draw_cursor();
-    } else {
-        if (vga_putc_color) vga_putc_color(c, tty_color);
+    if (c == '\n') {
+        tty_erase_cursor_t(t);
+        tty_newline(t);
+        tty_draw_cursor_t(t);
+        return;
     }
+    if (c == '\r') {
+        tty_erase_cursor_t(t);
+        t->x = 0;
+        tty_draw_cursor_t(t);
+        return;
+    }
+    if (c == '\t') {
+        tty_erase_cursor_t(t);
+        do {
+            tty_store_cell(t, t->x, t->y, ' ', t->color);
+            t->x++;
+            if (t->x >= t->cols) tty_newline(t);
+        } while (t->x && (t->x & 7));
+        tty_draw_cursor_t(t);
+        return;
+    }
+    if (c == '\b') {
+        tty_erase_cursor_t(t);
+        tty_backspace_t(t);
+        tty_draw_cursor_t(t);
+        return;
+    }
+
+    tty_erase_cursor_t(t);
+    tty_store_cell(t, t->x, t->y, c, t->color);
+    t->x++;
+    if (t->x >= t->cols) tty_newline(t);
+    tty_draw_cursor_t(t);
 }
 
-/* --- Редактирование строки: ввод --------------------------------- */
+void tty_write_char(char c) {
+    tty_putc(tty_active(), c);
+}
+
+void tty_backspace(void) {
+    tty_erase_cursor_t(tty_active());
+    tty_backspace_t(tty_active());
+    tty_draw_cursor_t(tty_active());
+}
+
+/* --- Редактирование строки --------------------------------------- */
 
 /* Здесь происходит редактирование строки: эхо, backspace, буфер.
- * Читатель (шелл и т.п.) получает готовую строку через tty_read().
- */
-static void tty_input_char(char c) {
+ * Вызывается из контекста читателя (tty_read), а не из IRQ: экран
+ * трогает только задача, владеющая консолью. */
+static void tty_input_char(tty_t *t, char c) {
+    tty_sync_dims(t);
+
     if (c == '\b' || c == 127) {
         /* Backspace: стираем только если в буфере строки есть символы */
-        if (tty_line_pos > 0) {
-            tty_line_pos--;
-            tty_line_len--;
-            memmove(&tty_line_buf[tty_line_pos], &tty_line_buf[tty_line_pos + 1],
-                    tty_line_len - tty_line_pos);
-            tty_line_buf[tty_line_len] = '\0';
-            tty_erase_cursor();
-            tty_backspace();
-            tty_draw_cursor();
+        if (t->line_pos > 0) {
+            t->line_pos--;
+            t->line_len--;
+            memmove(&t->line_buf[t->line_pos], &t->line_buf[t->line_pos + 1],
+                    t->line_len - t->line_pos);
+            t->line_buf[t->line_len] = '\0';
+            tty_putc(t, '\b');
         }
     } else if (c == '\n' || c == '\r') {
         /* Конец строки: помечаем строку готовой и выводим перевод строки */
-        tty_line_buf[tty_line_len++] = '\n';
-        tty_line_buf[tty_line_len] = '\0';
-        tty_line_pos = tty_line_len;
-        tty_line_complete = 1;
-        tty_write_char('\n');
+        t->line_buf[t->line_len++] = '\n';
+        t->line_buf[t->line_len] = '\0';
+        t->line_pos = t->line_len;
+        tty_putc(t, '\n');
     } else {
         /* Обычный символ: добавляем в буфер и выводим */
-        if (tty_line_len < TTY_LINE_BUF_SIZE - 1) {
-            memmove(&tty_line_buf[tty_line_pos + 1], &tty_line_buf[tty_line_pos],
-                    tty_line_len - tty_line_pos);
-            tty_line_buf[tty_line_pos] = c;
-            tty_line_len++;
-            tty_line_pos++;
-            tty_line_buf[tty_line_len] = '\0';
-            tty_write_char(c);
+        if (t->line_len < TTY_LINE_BUF_SIZE - 1) {
+            memmove(&t->line_buf[t->line_pos + 1], &t->line_buf[t->line_pos],
+                    t->line_len - t->line_pos);
+            t->line_buf[t->line_pos] = c;
+            t->line_len++;
+            t->line_pos++;
+            t->line_buf[t->line_len] = '\0';
+            tty_putc(t, c);
         }
     }
+}
+
+/* --- Нажатия: кольцо сырых символов ------------------------------ */
+
+static void tty_raw_push(tty_t *t, char c) {
+    uint32_t next = (t->raw_head + 1) % TTY_RAW_SIZE;
+    if (next == t->raw_tail) return;   /* переполнение: нажатие теряется */
+    t->raw[t->raw_head] = c;
+    t->raw_head = next;
+}
+
+static int tty_raw_pop(tty_t *t, char *c) {
+    if (t->raw_tail == t->raw_head) return 0;
+    *c = t->raw[t->raw_tail];
+    t->raw_tail = (t->raw_tail + 1) % TTY_RAW_SIZE;
+    return 1;
+}
+
+/* --- Переключение виртуальных консолей --------------------------- */
+
+static void tty_switch_to(int n) {
+    if (n < TTY_FIRST || n > TTY_LAST || n == tty_current) return;
+
+    tty_t *old = tty_active();
+    tty_t *next = &ttys[n];
+
+    /* Убираем курсор с оставляемого экрана до подмены содержимого. */
+    tty_erase_cursor_t(old);
+
+    tty_current = n;
+
+    tty_sync_dims(next);
+    tty_render_all(next);
+    tty_draw_cursor_t(next);
+}
+
+/* Приемник нажатий. Приходит из IRQ1 (клавиатура) и IRQ4 (COM1). */
+static void tty_keyboard_event(uint8_t scancode, char c, uint8_t mods) {
+    /* Alt+F1..F6 - переключение консолей, как в Linux. */
+    if ((mods & KBD_MOD_ALT) &&
+        scancode >= 0x3B && scancode <= 0x3B + (TTY_LAST - TTY_FIRST)) {
+        tty_switch_to(TTY_FIRST + (int)(scancode - 0x3B));
+        return;
+    }
+
+    if (!c || !tty_ready) return;
+    tty_raw_push(tty_active(), c);
 }
 
 /* --- Операции консольного устройства (регистрируются в VFS) ------- */
 
+/* Сопоставляем узел VFS конкретной консоли по имени. "console"/"tty"/
+ * "tty0" - это текущая консоль, "tty1".."tty6" - фиксированные. */
+static tty_t *tty_from_node(vfs_node_t *node) {
+    const char *n = node ? node->name : NULL;
+    if (n) {
+        if (strcmp(n, "console") == 0 || strcmp(n, "tty") == 0 || strcmp(n, "tty0") == 0) {
+            return tty_active();
+        }
+        if (n[0] == 't' && n[1] == 't' && n[2] == 'y' &&
+            n[3] >= '0' + TTY_FIRST && n[3] <= '0' + TTY_LAST && n[4] == '\0') {
+            return &ttys[n[3] - '0'];
+        }
+    }
+    return tty_active();
+}
+
 int32_t tty_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
-    (void)node;
     (void)offset;
+    tty_t *t = tty_from_node(node);
     if (size == 0) return 0;
 
-    /* Передаем нажатия в редактор строки, пока строка не будет введена */
-    while (1) {
-        char c = keyboard_getc();
-        if (c == '\r') c = '\n';
-        tty_input_char(c);
-        if (c == '\n') break;
+    /* Строка доставлена не до конца - продолжаем с того же места. */
+    if (t->deliver_pos >= t->deliver_len) {
+        /* Копим строку канонического режима. Ждем только нажатия этой
+         * консоли: пока она не активна, сюда ничего не придет. */
+        while (1) {
+            char c;
+            if (!tty_raw_pop(t, &c)) {
+                __asm__ volatile("hlt");
+                continue;
+            }
+            tty_input_char(t, c);
+            if (c == '\n' || c == '\r') break;
+        }
+
+        /* Забираем строку вместе с '\n' в буфер выдачи и начинаем редактор
+         * заново: так канонический режим отдает данные построчно. */
+        uint32_t n = t->line_len;
+        if (n > TTY_LINE_BUF_SIZE) n = TTY_LINE_BUF_SIZE;
+        memcpy(t->deliver, t->line_buf, n);
+        t->deliver_len = n;
+        t->deliver_pos = 0;
+
+        t->line_len = 0;
+        t->line_pos = 0;
+        t->line_buf[0] = '\0';
     }
 
-    /* Отдаем готовую строку вызывающему */
-    uint32_t len = tty_line_len - 1; /* без символа перевода строки */
-    if (len > size - 1) len = size - 1;
-    memcpy(buffer, tty_line_buf, len);
-    buffer[len] = '\0';
-
-    tty_line_len = 0;
-    tty_line_pos = 0;
-    tty_line_complete = 0;
-    tty_line_buf[0] = '\0';
-
-    return (int32_t)len;
+    uint32_t n = t->deliver_len - t->deliver_pos;
+    if (n > size) n = size;
+    memcpy(buffer, t->deliver + t->deliver_pos, n);
+    t->deliver_pos += n;
+    if (t->deliver_pos >= t->deliver_len) {
+        t->deliver_len = 0;
+        t->deliver_pos = 0;
+    }
+    return (int32_t)n;
 }
 
 int32_t tty_write(vfs_node_t *node, uint32_t offset, uint32_t size, const uint8_t *buffer) {
-    (void)node;
     (void)offset;
-    for (uint32_t i = 0; i < size; i++) tty_write_char((char)buffer[i]);
+    tty_t *t = tty_from_node(node);
+    for (uint32_t i = 0; i < size; i++) tty_putc(t, (char)buffer[i]);
     return (int32_t)size;
 }
 
@@ -395,18 +611,50 @@ static const vfs_device_t tty_devices[] = {
     /* "console" обслуживает stdio (fd 0/1/2), остальное - узлы /dev */
     { "console", tty_read, tty_write },
     { "tty",     tty_read, tty_write },
-    /* /dev/tty0 и /dev/tty1: текущая консоль. Виртуальных
-     * консолей в Masix пока нет, поэтому это то же самое устройство. */
-    // TODO: Сделать виртуальные консоли
+    /* /dev/tty0 - текущая консоль, как в Linux. */
     { "tty0",    tty_read, tty_write },
-    { "tty1",    tty_read, tty_write }
+    /* Шесть независимых виртуальных консолей для getty из inittab. */
+    { "tty1",    tty_read, tty_write },
+    { "tty2",    tty_read, tty_write },
+    { "tty3",    tty_read, tty_write },
+    { "tty4",    tty_read, tty_write },
+    { "tty5",    tty_read, tty_write },
+    { "tty6",    tty_read, tty_write }
 };
 
 void tty_init(void) {
+    for (int i = 0; i < TTY_COUNT; i++) {
+        tty_t *t = &ttys[i];
+        t->cols = 0;
+        t->rows = 0;
+        t->x = 0;
+        t->y = 0;
+        t->color = 0x07;
+        t->cursor_enabled = 1;
+        t->cursor_drawn = 0;
+        t->ansi_state = 0;
+        t->ansi_is_dec = 0;
+        t->ansi_arg1 = 0;
+        t->ansi_arg2 = 0;
+        t->ansi_which = 0;
+        t->raw_head = 0;
+        t->raw_tail = 0;
+        t->line_len = 0;
+        t->line_pos = 0;
+        t->line_buf[0] = '\0';
+        t->deliver_len = 0;
+        t->deliver_pos = 0;
+    }
+    tty_current = TTY_FIRST;
+
     /* Регистрируем все устройства из tty_devices в vfs (extern функция из vfs.c)
      * TODO: разделить девайсы TTY из общей структуры VFS
      */
     for (unsigned i = 0; i < sizeof(tty_devices) / sizeof(tty_devices[0]); i++) {
         vfs_register_device(&tty_devices[i]);
     }
+
+    /* Клавиатура отдает нажатия нам, а мы раскладываем их по консолям. */
+    keyboard_set_listener(tty_keyboard_event);
+    tty_ready = 1;
 }

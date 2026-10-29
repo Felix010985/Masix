@@ -83,7 +83,13 @@ static uint32_t* vmm_ensure_user_child(uint32_t* parent, uint32_t idx) {
         parent[idx] = phys | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         return vmm_phys_to_virt(phys);
     }
-    debug_puts("Masix: Debug: vmm_ensure_user_child executed.\n");
+    /* Запись могла остаться от тождественного отображения, которое теперь
+     * чисто ядерное (без USER). Для пользовательской страницы бит USER в
+     * записи каталога обязателен, иначе доступ из Ring 3 запрещён, даже
+     * если он выставлен в самой PTE. Досыпаем его, не трогая остальные. */
+    if (!(e & PAGE_USER)) {
+        parent[idx] = e | PAGE_USER;
+    }
     return vmm_phys_to_virt(e & PTE_ADDR_MASK);
 }
 
@@ -103,7 +109,6 @@ int vmm_user_map(uint32_t virt, uint32_t phys, uint32_t flags) {
     __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
     if ((current_cr3 & PAGE_MASK) == (g_user.pd_phys & PAGE_MASK))
         __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
-    debug_puts("Masix: Debug: vmm_user_map executed.\n");
 
     return 0;
 }
@@ -111,9 +116,6 @@ int vmm_user_map(uint32_t virt, uint32_t phys, uint32_t flags) {
 int vmm_userspace_create(void) {
     uint32_t pd_phys = pmm_alloc_zeroed();
     if (!pd_phys) return -1;
-    { extern void itoa(int,char*,int);
-      char b[16]; debug_puts("vmm: pd_phys=0x"); itoa((int)(((unsigned)pd_phys)>>16),b,16); debug_puts(b);
-      debug_puts("_"); itoa((int)(((unsigned)pd_phys)&0xFFFF),b,16); debug_puts(b); debug_puts("\n"); }
 
     uint32_t* dst = vmm_phys_to_virt(pd_phys);
 
@@ -135,7 +137,10 @@ int vmm_userspace_create(void) {
      */
     size_t kernel_start_idx = USER_TOP >> 22;
     for (size_t i = kernel_start_idx; i < 1024; ++i) {
-        dst[i] = boot_pd[i];
+        /* Верхняя половина - только ядро. Бит USER обязан быть снят:
+         * иначе Ring 3 через тождественное отображение 0xC0000000+ читает
+         * и пишет всю физическую память, включая кучу ядра с task_t. */
+        dst[i] = boot_pd[i] & ~PAGE_USER;
     }
 
     /* Отображаем один к одному всю физическую память, которую ядру
@@ -150,11 +155,13 @@ int vmm_userspace_create(void) {
         uint32_t* pt_virt = vmm_phys_to_virt(pt_phys);
 
         for (uint32_t i = 0; i < 1024; i++) {
-            // Мапим физический адрес 1в1 на виртуальный
-            pt_virt[i] = ((k * 1024 + i) * 4096) | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+            /* Тождественное отображение нужно самому ядру (оно ходит по
+             * физическим адресам) и фреймбуферу. Юзеру оно не нужно и
+             * опасно: страницы ядра и куча лежат в этом же диапазоне. */
+            pt_virt[i] = ((k * 1024 + i) * 4096) | PAGE_PRESENT | PAGE_WRITE;
         }
         // Кладем таблицу в каталог страниц нового процесса
-        dst[k] = pt_phys | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        dst[k] = pt_phys | PAGE_PRESENT | PAGE_WRITE;
     }
 
     { extern void itoa(int,char*,int); char b[16]; uint32_t e = dst[1012];
@@ -178,15 +185,29 @@ int vmm_userspace_create(void) {
 
 int vmm_userspace_clone(uint32_t src_cr3, uint32_t* dst_cr3_out) {
     if (!src_cr3 || !dst_cr3_out) return -1;
-    uint32_t* src = vmm_phys_to_virt(src_cr3 & PTE_ADDR_MASK); if (!src) return -1;
 
-    uint32_t dst_phys = pmm_alloc_zeroed(); if (!dst_phys) return -1;
+    /* Таблицы страниц лежат по физическим адресам и доступны ядру только
+     * через identity-отображение. В адресном пространстве задачи его может
+     * не быть (или его вытеснили пользовательские страницы), поэтому на
+     * время обхода таблиц переключаемся на каталог загрузчика, который
+     * отображает всю физическую память один к одному. Так же поступает
+     * vmm_userspace_destroy(). */
+    uint32_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    vmm_switch_cr3((uint32_t)boot_pd);
+
+    uint32_t* src = vmm_phys_to_virt(src_cr3 & PTE_ADDR_MASK);
+    if (!src) { vmm_switch_cr3(saved_cr3); return -1; }
+
+    uint32_t dst_phys = pmm_alloc_zeroed();
+    if (!dst_phys) { vmm_switch_cr3(saved_cr3); return -1; }
     uint32_t* dst = vmm_phys_to_virt(dst_phys);
 
     size_t kernel_start_idx = USER_TOP >> 22;
 
-    /* Динамически копируем ядерное отображение */
-    for (size_t i = kernel_start_idx; i < 1024; i++) dst[i] = src[i];
+    /* Динамически копируем ядерное отображение, сняв USER: потомок, как и
+     * родитель, не должен видеть память ядра из Ring 3. */
+    for (size_t i = kernel_start_idx; i < 1024; i++) dst[i] = src[i] & ~PAGE_USER;
 
     /* Клонируем только таблицы юзерспейса (все, что ниже границы ядра) */
     for (size_t i = 0; i < kernel_start_idx; i++) {
@@ -195,7 +216,7 @@ int vmm_userspace_clone(uint32_t src_cr3, uint32_t* dst_cr3_out) {
 
         uint32_t* src_pt = vmm_phys_to_virt(e & PTE_ADDR_MASK);
         uint32_t dst_pt_phys = pmm_alloc_zeroed();
-        if (!dst_pt_phys) return -1;
+        if (!dst_pt_phys) { vmm_switch_cr3(saved_cr3); return -1; }
         uint32_t* dst_pt = vmm_phys_to_virt(dst_pt_phys);
 
         for (size_t j = 0; j < 1024; j++) {
@@ -212,13 +233,14 @@ int vmm_userspace_clone(uint32_t src_cr3, uint32_t* dst_cr3_out) {
             }
 
             uint32_t new_page_phys = pmm_alloc_page();
-            if (!new_page_phys) return -1;
+            if (!new_page_phys) { vmm_switch_cr3(saved_cr3); return -1; }
             memcpy((void*)new_page_phys, (void*)page_phys, PAGE_SIZE);
             dst_pt[j] = (new_page_phys & PTE_ADDR_MASK) | (pte & ~PTE_ADDR_MASK);
         }
         dst[i] = dst_pt_phys | (e & ~PTE_ADDR_MASK);
     }
     *dst_cr3_out = dst_phys;
+    vmm_switch_cr3(saved_cr3);
     return 0;
 }
 
@@ -285,6 +307,20 @@ int vmm_userspace_destroy(uint32_t cr3) {
 
 uint32_t vmm_user_cr3(void) {
     return g_user_valid ? g_user.pd_phys : 0;
+}
+
+/* Привязывает "текущее" адресное пространство к каталогу задачи при
+ * переключении контекста. vmm_user_map() адресует страницы через g_user,
+ * поэтому после смены задачи он обязан указывать на ее каталог: иначе brk
+ * или mmap одной задачи правил бы чужие таблицы, а свой heap читался бы
+ * через identity-отображение как физическая память. */
+void vmm_bind_user_cr3(uint32_t cr3) {
+    if (cr3) {
+        g_user.pd_phys = cr3 & PAGE_MASK;
+        g_user_valid = true;
+    } else {
+        g_user_valid = false;
+    }
 }
 
 void vmm_user_switch(void) {

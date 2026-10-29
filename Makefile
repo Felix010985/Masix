@@ -32,7 +32,7 @@ TARGET_FLAGS ?= -target i686-unknown-elf
 ARCH_CFLAGS  ?= -Isys/kernel/arch/x86/include -Isys/kernel/arch/x86/i686/include
 LINKER_SCRIPT ?= sys/kernel/arch/x86/i686/linker.ld
 
-SYS_CFLAGS  := $(TARGET_FLAGS) -Isys/linuxkpi/include $(ARCH_CFLAGS) -Isys/kernel/include -Isys/kernel/drivers/include -Isys/tty/include -Isys/kernel/fs/include -Iinclude -ffreestanding -nostdlib -fno-stack-protector -fno-pic -O0 -g -Wall -Wextra -MMD
+SYS_CFLAGS  := $(TARGET_FLAGS) -Isys/linuxkpi/include $(ARCH_CFLAGS) -Iinclude/uapi -Isys/kernel/include -Isys/kernel/drivers/include -Isys/tty/include -Isys/kernel/fs/include -Iinclude -ffreestanding -nostdlib -fno-stack-protector -fno-pic -O0 -g -Wall -Wextra -MMD
 # Юзерленд bootstrap: свободностоящий, без libc и субмодулей.
 # Все системные вызовы, напрямую через int 0x80 (bootstrap/src/syscall.h).
 BOOT_CFLAGS  := $(TARGET_FLAGS) -I$(BOOTSTRAP_DIR)/src -nostdinc -ffreestanding -mno-sse -mno-sse2 -fno-stack-protector -fno-pic -static -Os -ffunction-sections -fdata-sections -Wall -Wextra -MMD
@@ -82,15 +82,15 @@ initramfs: $(INITRAMFS_IMG)
 	printf "$(CLR_GREEN)==== Сборка initramfs завершена ====$(CLR_RESET)\n"
 
 .PHONY: iso
-iso: $(BUILD_DIR)/mazukios.iso
+iso: $(BUILD_DIR)/masix.iso
 	printf "$(CLR_GREEN)==== ISO-образ Masix полностью готов к тестированию! ====$(CLR_RESET)\n"
 
 .PHONY: run
 run: iso
 	printf "$(CLR_MAGENTA)==== Запуск Masix в QEMU ====$(CLR_RESET)\n"
-	$(QEMU) -cdrom $(BUILD_DIR)/mazukios.iso -m 256M -serial stdio -nic user,model=rtl8139 -no-reboot -no-shutdown
+	$(QEMU) -cdrom $(BUILD_DIR)/masix.iso -m 256M -serial stdio -nic user,model=rtl8139 -no-reboot -no-shutdown
 
-$(BUILD_DIR)/mazukios.iso: $(KERNEL_ELF) $(KERNEL_BZ) $(INITRAMFS_IMG) $(GRUB_DIR)/grub.cfg
+$(BUILD_DIR)/masix.iso: $(KERNEL_ELF) $(KERNEL_BZ) $(INITRAMFS_IMG) $(GRUB_DIR)/grub.cfg
 	printf "$(STATUS_INFO) Создание ISO-образа с initramfs\n"
 	mkdir -p $(BOOT_DIR)
 	cp $(KERNEL_ELF) $(BOOT_DIR)/
@@ -147,27 +147,24 @@ $(BUILD_DIR)/$(BOOTSTRAP_DIR)/%.elf: $(BOOTSTRAP_DIR)/%.c
 	fi; \
 	rm -f $(BUILD_DIR)/tmp_boot_err.log
 
+# initramfs собирается из статических bootstrap-бинарников: собственный
+# ABI Masix, никакого внешнего userland. Ядро ищет в архиве жестко
+# прописанный ./bin/init (см. sys/kernel/initramfs.c) и запускает его
+# как PID 1; если отдельного init нет, им становится sh.
 $(INITRAMFS_IMG): $(BOOT_ELFS)
-	printf "$(STATUS_INFO) Упаковка initramfs в формат CPIO...\n"
-	mkdir -p $(ROOTFS_SRC_DIR)/bin
-	mkdir -p $(ROOTFS_SRC_DIR)/etc
-	mkdir -p $(ROOTFS_SRC_DIR)/dev
-	mkdir -p $(ROOTFS_SRC_DIR)/proc
-	mkdir -p $(ROOTFS_SRC_DIR)/sys
-
+	printf "$(STATUS_INFO) Упаковка bootstrap-rootfs в initramfs (CPIO newc)...\n"
+	rm -rf $(ROOTFS_SRC_DIR)
+	mkdir -p $(ROOTFS_SRC_DIR)/bin $(ROOTFS_SRC_DIR)/etc $(ROOTFS_SRC_DIR)/dev \
+	         $(ROOTFS_SRC_DIR)/proc $(ROOTFS_SRC_DIR)/sys
 	for elf in $(BOOT_ELFS); do \
 		cp $$elf $(ROOTFS_SRC_DIR)/bin/$$(basename $$elf .elf); \
 	done
-
 	if [ ! -f $(ROOTFS_SRC_DIR)/bin/init ] && [ -f $(ROOTFS_SRC_DIR)/bin/sh ]; then \
 		cp $(ROOTFS_SRC_DIR)/bin/sh $(ROOTFS_SRC_DIR)/bin/init; \
 	fi
-
 	echo "Welcome to Masix (kernel bootstrap)!" > $(ROOTFS_SRC_DIR)/etc/motd
-
-	cd $(ROOTFS_SRC_DIR) && find . | cpio -o -H newc > ../../$(INITRAMFS_IMG) 2>/dev/null
+	cd $(ROOTFS_SRC_DIR) && find . | cpio -o -H newc -R 0:0 > $(abspath $(INITRAMFS_IMG)) 2>/dev/null
 	printf "      $(CLR_GRAY)| Размер initramfs: $$(wc -c < $(INITRAMFS_IMG)) байт$(CLR_RESET)\n"
-
 	rm -rf $(ROOTFS_SRC_DIR)
 
 $(BUILD_DIR)/sys/%.o: sys/%.c

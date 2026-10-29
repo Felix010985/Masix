@@ -10,7 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HEAP_SIZE 0x10000
+#define HEAP_SIZE 0x100000
 static uint8_t heap[HEAP_SIZE];
 
 /* Каждому выделенному блоку памяти предшествует этот заголовок */
@@ -23,7 +23,24 @@ typedef struct block_header {
 static block_header_t *free_list = (block_header_t*)heap;
 static int is_initialized = 0;
 
+/* Системный вызов исполняется с разрешёнными прерываниями, поэтому тик
+ * PIT может вытеснить задачу прямо посреди работы с кучей, а следующая
+ * задача - снова позвать malloc. Список свободных блоков от такого
+ * наложения рушится, и два выделения возвращают одну и ту же память.
+ * Поэтому на время операций над кучей запрещаем прерывания. */
+static inline uint32_t alloc_irq_save(void) {
+    uint32_t flags;
+    __asm__ __volatile__("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void alloc_irq_restore(uint32_t flags) {
+    __asm__ __volatile__("pushl %0\n\tpopfl" :: "r"(flags) : "memory");
+}
+
 void* alloc(size_t size) {
+    uint32_t flags = alloc_irq_save();
+
     /* При первом вызове размечаем весь массив как один большой свободный блок */
     if (!is_initialized) {
         free_list->size = HEAP_SIZE - sizeof(block_header_t);
@@ -49,15 +66,27 @@ void* alloc(size_t size) {
                 curr->next = next_block;
             }
             curr->is_free = 0;
+            alloc_irq_restore(flags);
             return (void*)((uint8_t*)curr + sizeof(block_header_t));
         }
         curr = curr->next;
     }
+    alloc_irq_restore(flags);
     return NULL;
 }
 
 void alloc_free(void* ptr) {
     if (!ptr) return;
+
+    uint32_t flags = alloc_irq_save();
+
+    /* Освобождать можно только указатель внутри кучи: узлы устройств
+     * из BSS (например console_node) не наши. */
+    if ((uint8_t*)ptr < heap + sizeof(block_header_t) ||
+        (uint8_t*)ptr >= heap + HEAP_SIZE) {
+        alloc_irq_restore(flags);
+        return;
+    }
 
     block_header_t *header = (block_header_t*)((uint8_t*)ptr - sizeof(block_header_t));
     header->is_free = 1;
@@ -74,6 +103,8 @@ void alloc_free(void* ptr) {
             curr = curr->next;
         }
     }
+
+    alloc_irq_restore(flags);
 }
 
 void* malloc(size_t size) {

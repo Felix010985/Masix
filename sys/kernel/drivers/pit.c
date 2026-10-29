@@ -20,6 +20,9 @@ static volatile uint32_t system_ticks = 0;
 
 
 void pit_handler_c(void) {
+    /* ТАК ДЕЛАТЬ НЕЛЬЗЯ
+     * но я пока сделаю все равно до 4.0.0 еще далеко
+     */
     system_ticks++;
     rtl8139_poll();
 }

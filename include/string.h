@@ -1,3 +1,4 @@
+#include <linux/types.h>
 void* memcpy(void* dst, const void* src, unsigned int n);
 void* memmove(void* dst, const void* src, unsigned int n);
 void* memset(void* dst, int value, unsigned int n);

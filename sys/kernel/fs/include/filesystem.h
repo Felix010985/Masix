@@ -14,11 +14,15 @@
 
 #define DISK_SIZE 1024*1024
 #define BLOCK_SIZE 512
-#define MAX_FILES 1024
+/* Таблица узлов должна быть просторнее минимальной: при нехватке
+ * слотов fs_create_type() молча отказывается регистрировать файл, и такие
+ * важные вещи, как /etc/inittab, могут не попасть в VFS. */
+#define MAX_FILES 4096
 #define MAX_BLOCKS_PER_FILE 10
 #define TOTAL_BLOCKS (DISK_SIZE / BLOCK_SIZE)
 #define FS_REGULAR 1
 #define FS_DIRECTORY 2
+#define FS_SYMLINK 3
 
 extern unsigned char disk[DISK_SIZE];
 extern unsigned char block_bitmap[TOTAL_BLOCKS/8];

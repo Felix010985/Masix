@@ -20,5 +20,9 @@ uint32_t pmm_alloc_page(void);
 uint32_t pmm_alloc_zeroed(void);
 void pmm_free_page(uint32_t phys);
 uint32_t pmm_free_count(void);
+/* Резервирует диапазон физической памяти (включая initramfs модули),
+ * чтобы аллокатор не отдавал эти страницы. start/end должны быть
+ * выровнены по границе страницы. */
+void pmm_reserve_range(uint32_t start, uint32_t end);
 
 #endif

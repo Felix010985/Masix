@@ -16,6 +16,7 @@
 
 #define VFS_FILE      1
 #define VFS_DIRECTORY 2
+#define VFS_SYMLINK   3
 
 #define MAX_FD 32
 #define PIPE_COUNT 8
@@ -46,6 +47,10 @@ typedef struct vfs_node {
 
     vfs_read_t  read;
     vfs_write_t write;
+    /* Ссылки: при fork потомок получает те же fd, поэтому узел
+     * может использоваться несколькими процессами одновременно.
+     * free() только когда refcount == 0. */
+    int refcount;
 } vfs_node_t;
 
 void vfs_init(void);
@@ -103,7 +108,9 @@ typedef struct file {
     void* private_data;  // Указатель на vfs_node_t ИЛИ на структуру устройства
 } file_t;
 
-extern file_t fd_table[32];
+/* Таблица дескрипторов текущей задачи. До создания первой задачи
+ * (инициализация VFS) возвращается таблица-заглушка ядра. */
+file_t* vfs_fd_table(void);
 
 int32_t vfs_close(int fd);
 int32_t vfs_pipe(int32_t pipefd[2]);

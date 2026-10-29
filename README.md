@@ -5,7 +5,7 @@
 <h1 align="center">Masix</h1>
 
 <p align="center">
-  Независимое POSIX-совместимое ядро для x86 (i686) **И В БУДУЩЕМ НЕ ТОЛЬКО**, написанное с нуля.
+  Независимое POSIX-совместимое ядро для x86 (i686), написанное с нуля.
 </p>
 
 ---
@@ -67,8 +67,8 @@
 - **Unix-сокеты** `AF_UNIX` + `SOCK_STREAM` (`bind`, `listen`, `connect`,
   `accept`, `send`, `recv`) через Linux i386 `socketcall`.
 - **Сеть `AF_INET`**: UDP (`SOCK_DGRAM`) для петлевого интерфейса
-  `3.0.2.1`, плюс драйвер **RTL8139** (PCI) с опросом RX/TX, ARP и
-  статическим адресом `3.0.2.15`.
+  `3.0.1.1`, плюс драйвер **RTL8139** (PCI) с опросом RX/TX, ARP и
+  статическим адресом `3.0.1.15`.
 
 ### 🖥️ Консоль
 - Драйвер **линейного фреймбуфера** с выводом текста, шрифтами (PSF и
@@ -171,10 +171,14 @@ make run
 | `make kernel` | только ELF ядра |
 | `make bzimage` | образ под протокол LINUX |
 | `make bootstrap` | только юзерленд |
-| `make initramfs` | только CPIO-образ |
-| `make iso` | загрузочный ISO |
+| `make initramfs` | только CPIO-образ из bootstrap-бинарников |
+| `make iso` | загрузочный ISO (`build/masix.iso`) |
 | `make run` | `make iso` + запуск в QEMU |
 | `make clean` | очистка `build/` |
+
+Initramfs собирается только из статических bootstrap-бинарников
+(`bootstrap/src`): внешний userland и готовый сторонний rootfs в дереве не
+используются.
 
 ## 📑 Структура репозитория
 

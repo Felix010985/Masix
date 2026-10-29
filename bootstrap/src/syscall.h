@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Masix Kernel — bootstrap userland
+ * Masix Kernel - bootstrap userland
  * Copyright (C) 2026, FelixProfi. All rights reserved.
  *
  * Прямые системные вызовы ядра Masix. Номера совпадают с

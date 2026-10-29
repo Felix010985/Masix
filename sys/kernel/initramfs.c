@@ -72,12 +72,20 @@ void initramfs_unpack(uint32_t archive_start, uint32_t archive_size) {
         uint32_t data_offset = (sizeof(struct cpio_newc_header) + namesize + 3) & ~3;
         uint8_t* file_data = ptr + data_offset;
 
-        if (strcmp(filename, ".") != 0 && strcmp(filename, "..") != 0) {
+        if (strcmp(filename, "..") != 0) {
 
             char clean_path[256];
 
+            /* Корень архива (запись ".") регистрируем как "/": без него
+             * chdir("/") и разрешение путей в VFS не находят корень. */
+
+            // тут точно где то есть баг, я просто не могу его найти
+            if (strcmp(filename, ".") == 0) {
+                clean_path[0] = '/';
+                clean_path[1] = '\0';
+            }
             /* Если имя в архиве начинается с "./", заменяем "." на "/" */
-            if (memcmp(filename, "./", 2) == 0) {
+            else if (memcmp(filename, "./", 2) == 0) {
                 clean_path[0] = '/';
                 strncpy(clean_path + 1, filename + 2, sizeof(clean_path) - 2);
             }
@@ -94,11 +102,15 @@ void initramfs_unpack(uint32_t archive_start, uint32_t archive_size) {
             clean_path[sizeof(clean_path) - 1] = '\0';
 
             uint32_t mode = initramfs_parse_hex(header->c_mode, 8);
-            unsigned int type = (mode & 0170000) == 0040000 ? FS_DIRECTORY : FS_REGULAR;
+            unsigned int fmt = mode & 0170000;
+            unsigned int type = fmt == 0040000 ? FS_DIRECTORY :
+                                fmt == 0120000 ? FS_SYMLINK : FS_REGULAR;
             int idx = fs_create_type(clean_path, type);
             if (idx != -1) {
-                /* Регистрируем cpio файл в VFS */
-                if (type == FS_REGULAR) fs_attach_external(idx, file_data, filesize);
+                /* Регистрируем cpio файл в VFS. Для симлинка external_data
+                 * указывает на цель ссылки - VFS разворачивает её сам. */
+                if (type == FS_REGULAR || type == FS_SYMLINK)
+                    fs_attach_external(idx, file_data, filesize);
 
                 debug_puts("Masix: Registered cpio file in VFS: ");
                 debug_puts(clean_path);

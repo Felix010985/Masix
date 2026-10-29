@@ -64,14 +64,25 @@ void pmm_init(uint32_t mem_lower, uint32_t mem_upper) {
 uint32_t pmm_alloc_page(void) {
     if (!g_ready || !g_free_pages) return 0;
 
+    /* Битовая карта страниц общая на всю систему, а системный вызов
+     * исполняется с разрешёнными прерываниями: без запрета прерываний
+     * вытесненная на середине задачи могла бы отдать ту же страницу
+     * дважды. */
+    uint32_t flags;
+    __asm__ __volatile__("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) :: "memory");
+
+    uint32_t result = 0;
     for (uint32_t p = g_memory_start; p < g_memory_end; p += PAGE_SIZE) {
         if (!pmm_page_is_allocated(p)) {
             pmm_page_set_allocated(p, true);
             g_free_pages--;
-            return p;
+            result = p;
+            break;
         }
     }
-    return 0;
+
+    __asm__ __volatile__("pushl %0\n\tpopfl" :: "r"(flags) : "memory");
+    return result;
 }
 
 uint32_t pmm_alloc_zeroed(void) {
@@ -89,6 +100,20 @@ void pmm_free_page(uint32_t phys) {
         pmm_page_set_allocated(phys, false);
     g_free_pages++;
     debug_puts("Masix: Debug: pmm_free_page executed.\n");
+}
+
+void pmm_reserve_range(uint32_t start, uint32_t end) {
+    if (!g_ready) return;
+    if (start > end) return;
+    if (start < g_memory_start) start = g_memory_start;
+    if (end > g_memory_end) end = g_memory_end;
+
+    for (uint32_t p = start; p < end; p += PAGE_SIZE) {
+        if (!pmm_page_is_allocated(p)) {
+            pmm_page_set_allocated(p, true);
+            if (g_free_pages > 0) g_free_pages--;
+        }
+    }
 }
 
 uint32_t pmm_free_count(void) { return g_free_pages; }

@@ -45,8 +45,40 @@ typedef struct {
     uint32_t p_align;
 } Elf32_Phdr;
 
-#define PT_LOAD 1
+#define PT_LOAD   1
+#define PT_INTERP 3
 
+#define ELF_ET_DYN 3
+
+/* Базы для образов, собранных как PIE (ET_DYN). Сегменты таких файлов
+ * описаны относительно нуля, поэтому загрузчику нужна ненулевая база:
+ * иначе первый же PT_LOAD отобразился бы на страницу 0. Основную
+ * программу и интерпретатор раскладываем в разные регионы ниже USER_TOP. */
+#define ELF_MAIN_BASE   0x08048000u
+#define ELF_INTERP_BASE 0x40000000u
+
+struct elf_aux_info elf_aux;
+
+/* Источник байтов ELF: либо сырой образ в памяти (init из initramfs),
+ * либо файл VFS (когда программу поднимает execve). */
+struct elf_source {
+    const uint8_t* mem;
+    uint32_t       mem_size;
+    vfs_node_t*    node;
+};
+
+static int32_t elf_source_read(void* context, uint32_t offset, uint32_t size, void* buffer) {
+    struct elf_source* src = (struct elf_source*)context;
+    if (src->mem) {
+        if (offset > src->mem_size || size > src->mem_size - offset) return -1;
+        memcpy(buffer, src->mem + offset, size);
+        return (int32_t)size;
+    }
+    if (src->node && src->node->read) {
+        return src->node->read(src->node, offset, size, (uint8_t*)buffer);
+    }
+    return -1;
+}
 
 static int elf_header_valid(const Elf32_Ehdr* header, uint32_t file_size) {
     if (header->e_ident[0] != 0x7F || header->e_ident[1] != 'E' ||
@@ -57,10 +89,84 @@ static int elf_header_valid(const Elf32_Ehdr* header, uint32_t file_size) {
     return 1;
 }
 
-void* elf_load_binary(uint32_t file_start) {
-    Elf32_Ehdr* elf_header = (Elf32_Ehdr*)file_start;
+/* Раскладывает PT_LOAD-сегменты одного DSO по его базе. Для ET_EXEC база
+ * игнорируется: адреса в сегментах уже абсолютные. Возвращает точку входа
+ * с учетом базы либо 0 при ошибке. Через out_phdr отдает виртуальный адрес
+ * таблицы программных заголовков (это нужно musl-овскому AT_PHDR). */
+static uint32_t elf_map_dso(struct elf_source* src, const Elf32_Ehdr* eh,
+                            uint32_t base, uint32_t* out_phdr) {
+    uint32_t bias = (eh->e_type == ELF_ET_DYN) ? base : 0;
 
-    if (!elf_header_valid(elf_header, 0xFFFFFFFFU)) {
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf32_Phdr ph;
+        if (elf_source_read(src, eh->e_phoff + (uint32_t)i * sizeof(Elf32_Phdr),
+                            sizeof(ph), &ph) != (int32_t)sizeof(ph)) {
+            debug_puts("Masix: ELF: phdr read failed\n");
+            return 0;
+        }
+        if (ph.p_type != PT_LOAD) continue;
+
+        uint32_t vstart = ph.p_vaddr + bias;
+        uint32_t vend = vstart + ph.p_memsz;
+        uint32_t page_start = vstart & ~(PAGE_SIZE - 1);
+        uint32_t page_end = (vend + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+        /* Идем по страницам, выделяем память и мапим её. Флаг PTE_W берем,
+         * если сегмент ELF разрешает запись. */
+        for (uint32_t va = page_start; va < page_end; va += PAGE_SIZE) {
+            uint32_t phys = pmm_alloc_zeroed();
+            if (!phys) {
+                debug_puts("Masix: ELF: Out of physical memory!\n");
+                return 0;
+            }
+            uint32_t flags = (ph.p_flags & 0x2) ? PAGE_WRITE : 0;
+            if (vmm_user_map(va, phys, flags) != 0) return 0;
+        }
+
+        /* Копируем данные из источника в замапленную виртуальную память.
+         * Ring 0 пишет и в read-only страницы: CR0.WP ядро не включает. */
+        if (ph.p_filesz > 0) {
+            if (elf_source_read(src, ph.p_offset, ph.p_filesz,
+                                (void*)vstart) != (int32_t)ph.p_filesz) {
+                debug_puts("Masix: ELF: phdr data read failed\n");
+                return 0;
+            }
+        }
+
+        /* Если размер в памяти больше размера в файле, обнуляем остаток. */
+        if (ph.p_memsz > ph.p_filesz) {
+            memset((void*)(vstart + ph.p_filesz), 0, ph.p_memsz - ph.p_filesz);
+        }
+    }
+
+    if (out_phdr) *out_phdr = bias + eh->e_phoff;
+    return bias + eh->e_entry;
+}
+
+/* Ищет PT_INTERP и копирует путь интерпретатора в out (с завершающим 0). */
+static int elf_find_interp(struct elf_source* src, const Elf32_Ehdr* eh,
+                           char* out, uint32_t out_size) {
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        Elf32_Phdr ph;
+        if (elf_source_read(src, eh->e_phoff + (uint32_t)i * sizeof(Elf32_Phdr),
+                            sizeof(ph), &ph) != (int32_t)sizeof(ph)) return -1;
+        if (ph.p_type != PT_INTERP) continue;
+        if (ph.p_filesz == 0 || ph.p_filesz >= out_size) return -1;
+        if (elf_source_read(src, ph.p_offset, ph.p_filesz, out) != (int32_t)ph.p_filesz) return -1;
+        out[ph.p_filesz] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+/* Общая загрузка ELF: создает адресное пространство, раскладывает основную
+ * программу и, если файл динамический, интерпретатор (musl ld.so). Возвращает
+ * точку входа, на которую нужно прыгнуть (для динамических программ - это
+ * точка входа интерпретатора), и заполняет elf_aux для начального стека. */
+static void* elf_load_common(struct elf_source* main_src) {
+    Elf32_Ehdr eh;
+    if (elf_source_read(main_src, 0, sizeof(eh), &eh) != (int32_t)sizeof(eh) ||
+        !elf_header_valid(&eh, main_src->mem ? main_src->mem_size : main_src->node->size)) {
         debug_puts("Masix: ELF: Invalid magic signature!\n");
         return NULL;
     }
@@ -71,90 +177,73 @@ void* elf_load_binary(uint32_t file_start) {
         return NULL;
     }
 
-    Elf32_Phdr* phdr = (Elf32_Phdr*)(file_start + elf_header->e_phoff);
+    memset(&elf_aux, 0, sizeof(elf_aux));
+    elf_aux.phent = sizeof(Elf32_Phdr);
+    elf_aux.phnum = eh.e_phnum;
 
-    for (int i = 0; i < elf_header->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD) {
+    uint32_t main_entry = elf_map_dso(main_src, &eh, ELF_MAIN_BASE, &elf_aux.phdr);
+    if (!main_entry) return NULL;
+    elf_aux.entry = main_entry;
 
-            uint32_t start_vaddr = phdr[i].p_vaddr;
-            uint32_t end_vaddr = start_vaddr + phdr[i].p_memsz;
+    char interp[256];
+    if (elf_find_interp(main_src, &eh, interp, sizeof(interp)) == 0) {
+        debug_puts("Masix: ELF: interpreter: ");
+        debug_puts(interp);
+        debug_puts("\n");
 
-            uint32_t page_start = start_vaddr & ~0xFFF;
-            uint32_t page_end = (end_vaddr + 0xFFF) & ~0xFFF;
-
-            /* Идем по страницам, выделяем память и мапим её */
-            for (uint32_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
-                uint32_t phys = pmm_alloc_zeroed();
-                if (!phys) {
-                    debug_puts("Masix: ELF: Out of physical memory!\n");
-                    return NULL;
-                }
-                // Мапим виртуальный адрес на выделенную физическую страницу
-                // Флаг PTE_W берем, если сегмент ELF разрешает запись.
-                uint32_t flags = (phdr[i].p_flags & 0x2) ? PAGE_WRITE : 0;
-                vmm_user_map(vaddr, phys, flags);
-            }
-
-            /* Копируем данные из initramfs в только что замапленную виртуальную память */
-            if (phdr[i].p_filesz > 0) {
-                memcpy((void*)start_vaddr, (void*)(file_start + phdr[i].p_offset), phdr[i].p_filesz);
-            }
-
-            /* Если размер в памяти больше размера в файле, обнуляем остаток */
-            if (phdr[i].p_memsz > phdr[i].p_filesz) {
-                uint32_t bss_start = start_vaddr + phdr[i].p_filesz;
-                uint32_t bss_size = phdr[i].p_memsz - phdr[i].p_filesz;
-                memset((void*)bss_start, 0, bss_size);
-            }
+        int fd = vfs_open(interp);
+        if (fd < 0) {
+            debug_puts("Masix: ELF: interpreter not found!\n");
+            return NULL;
         }
+
+        struct elf_source isrc;
+        isrc.mem = NULL;
+        isrc.mem_size = 0;
+        isrc.node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
+
+        Elf32_Ehdr ieh;
+        uint32_t interp_entry = 0;
+        int32_t hdr_read = elf_source_read(&isrc, 0, sizeof(ieh), &ieh);
+        int hdr_valid = 0;
+        if (hdr_read == (int32_t)sizeof(ieh)) {
+            hdr_valid = elf_header_valid(&ieh, isrc.node->size);
+        }
+        if (hdr_read == (int32_t)sizeof(ieh) && hdr_valid) {
+            interp_entry = elf_map_dso(&isrc, &ieh, ELF_INTERP_BASE, NULL);
+        }
+        vfs_close(fd);
+
+        if (!interp_entry) {
+            debug_puts("Masix: ELF: failed to load interpreter!\n");
+            return NULL;
+        }
+
+        elf_aux.base = ELF_INTERP_BASE;
+        elf_aux.interp = interp_entry;
+
+        vmm_user_switch();
+        return (void*)interp_entry;
     }
 
-    /* Загружаем свежесозданный каталог страниц в регистр CR3 процессора,
-     * чтобы активировать изолированное адресное пространство этой программы.
-     */
+    /* Статический файл: прыгаем прямо на него, интерпретатор не нужен. */
     vmm_user_switch();
-    uint32_t entry = elf_header->e_entry;
-    __asm__ volatile("" : : "a"(entry));
+    return (void*)main_entry;
+}
 
-    return (void*)entry;
-    //return (void*)elf_header->e_entry;
+void* elf_load_binary(uint32_t file_start) {
+    struct elf_source src;
+    src.mem = (const uint8_t*)file_start;
+    src.mem_size = 0xFFFFFFFFU;
+    src.node = NULL;
+    return elf_load_common(&src);
 }
 
 void* elf_load_node(vfs_node_t* node) {
-    Elf32_Ehdr header;
-    if (!node || !node->read || node->read(node, 0, sizeof(header), (uint8_t*)&header) != sizeof(header) ||
-        !elf_header_valid(&header, node->size)) {
-        return NULL;
-    }
-
-    if (vmm_userspace_create() != 0) return NULL;
-
-    for (uint16_t i = 0; i < header.e_phnum; i++) {
-        Elf32_Phdr phdr;
-        uint32_t offset = header.e_phoff + (uint32_t)i * sizeof(phdr);
-        if (node->read(node, offset, sizeof(phdr), (uint8_t*)&phdr) != sizeof(phdr)) goto fail;
-        if (phdr.p_type != PT_LOAD) continue;
-        if (phdr.p_memsz < phdr.p_filesz ||
-            phdr.p_offset > node->size || phdr.p_filesz > node->size - phdr.p_offset ||
-            phdr.p_vaddr >= USER_TOP || phdr.p_memsz > USER_TOP - phdr.p_vaddr) { debug_puts("Masix: ELF: bad phdr bounds\n"); goto fail; }
-
-        uint32_t page_start = phdr.p_vaddr & ~(PAGE_SIZE - 1);
-        uint32_t page_end = (phdr.p_vaddr + phdr.p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        for (uint32_t vaddr = page_start; vaddr < page_end; vaddr += PAGE_SIZE) {
-            uint32_t phys = pmm_alloc_zeroed();
-            if (!phys || vmm_user_map(vaddr, phys, (phdr.p_flags & 2) ? PAGE_WRITE : 0) != 0) goto fail;
-        }
-
-        if (phdr.p_filesz && node->read(node, phdr.p_offset, phdr.p_filesz,
-                                        (uint8_t*)phdr.p_vaddr) != (int32_t)phdr.p_filesz) goto fail;
-        if (phdr.p_memsz > phdr.p_filesz) {
-            memset((void*)(phdr.p_vaddr + phdr.p_filesz), 0, phdr.p_memsz - phdr.p_filesz);
-        }
-    }
-
-    vmm_user_switch();
-    return (void*)header.e_entry;
-
-fail:
-    return NULL;
+    if (!node || !node->read) return NULL;
+    struct elf_source src;
+    src.mem = NULL;
+    src.mem_size = 0;
+    src.node = node;
+    return elf_load_common(&src);
 }

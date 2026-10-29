@@ -11,16 +11,19 @@
 #include <idt.h>
 #include <drivers/io.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
 
-#define KBD_BUFFER_SIZE 256
-static char kbd_buffer[KBD_BUFFER_SIZE];
-volatile static int kbd_head = 0;
-volatile static int kbd_tail = 0;
-
+/* Зажатые модификаторы. */
 static int shift = 0;
+static int ctrl = 0;
+static int alt = 0;
+/* Префикс 0xE0: следующие один-два байта - расширенная клавиша. */
+static int extended = 0;
+
+static keyboard_listener_t kbd_listener = NULL;
 
 static const char scancode_table[128] = {
     0, 27,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',
@@ -38,47 +41,56 @@ static const char scancode_shift_table[128] = {
     '*',0,' ',0,
 };
 
+void keyboard_set_listener(keyboard_listener_t listener) {
+    kbd_listener = listener;
+}
+
+static void keyboard_emit(uint8_t scancode, char c, uint8_t mods) {
+    if (kbd_listener) kbd_listener(scancode, c, mods);
+}
+
 void keyboard_push_char(char c) {
-    int next = (kbd_head + 1) % KBD_BUFFER_SIZE;
-    if (next != kbd_tail) {
-        kbd_buffer[kbd_head] = c;
-        kbd_head = next;
-    }
+    /* Источник не клавиатура (COM1), поэтому модификаторов нет. */
+    keyboard_emit(0, c, 0);
 }
 
 void keyboard_handler_c(void) {
-    if (inb(KBD_STATUS) & 1) {
-        uint8_t sc = inb(KBD_DATA);
+    if (!(inb(KBD_STATUS) & 1)) return;
 
-        if (sc & 0x80) {
-            sc &= 0x7F;
-            if (sc == 42 || sc == 54) shift = 0;
-            return;
-        }
-        if (sc == 42 || sc == 54) {
-            shift = 1;
-            return;
-        }
+    uint8_t sc = inb(KBD_DATA);
 
-        char c = shift ? scancode_shift_table[sc] : scancode_table[sc];
-        if (c) {
-            keyboard_push_char(c);
-        }
+    /* 0xE0 открывает расширенную клавишу (стрелки, правые Ctrl/Alt).
+     * Символы таких клавиш нам пока не нужны, но отпускание правых
+     * Ctrl/Alt важно, иначе модификатор залипнет. */
+    if (sc == 0xE0) {
+        extended = 1;
+        return;
     }
-}
 
-char keyboard_getc(void) {
-    while (1) {
-        if (kbd_head != kbd_tail) {
-            char c = kbd_buffer[kbd_tail];
-            kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
-            return c;
-        }
-        __asm__ volatile("hlt");
+    int is_break = (sc & 0x80) ? 1 : 0;
+    uint8_t code = sc & 0x7F;
+
+    if (extended) {
+        extended = 0;
+        if (code == 0x1D) ctrl = is_break ? 0 : 1;
+        else if (code == 0x38) alt = is_break ? 0 : 1;
+        return;
     }
+
+    if (code == 0x2A || code == 0x36) { shift = is_break ? 0 : 1; return; }
+    if (code == 0x1D) { ctrl = is_break ? 0 : 1; return; }
+    if (code == 0x38) { alt = is_break ? 0 : 1; return; }
+    if (is_break) return;
+
+    char c = shift ? scancode_shift_table[code] : scancode_table[code];
+    uint8_t mods = (uint8_t)((shift ? KBD_MOD_SHIFT : 0) |
+                             (ctrl ? KBD_MOD_CTRL : 0) |
+                             (alt ? KBD_MOD_ALT : 0));
+
+    /* Отдаем нажатие целиком, даже если символ не получился: так
+     * обрабатываются функциональные клавиши (Alt+F1..F6). */
+    keyboard_emit(code, c, mods);
 }
-
-
 
 __attribute__((naked)) void keyboard_handler_asm(void) {
     __asm__ __volatile__ (
@@ -101,4 +113,3 @@ __attribute__((naked)) void keyboard_handler_asm(void) {
 void keyboard_init(void) {
     idt_register_handler(0x21, (uint32_t)keyboard_handler_asm, 0xEE);
 }
-

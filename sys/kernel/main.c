@@ -104,12 +104,19 @@ void main_kernel_main(void) {
         }
     }
 
-    /* initramfs приходит модулем, его загрузчик положил куда ему угодно. */
+    /* initramfs приходит модулем, его загрузчик положил куда ему угодно.
+     * После распаковки резервируем физическую память модуля в PMM,
+     * чтобы аллокатор не отдал эти страницы под кучу/стеки - иначе
+     * данные initramfs повреждаются. */
     for (uint32_t i = 0; i < boot_info.module_count; i++) {
         struct boot_module* mod = &boot_info.modules[i];
-
-                debug_puts("Masix: initramfs module located in memory.\n");
+        debug_puts("Masix: initramfs module located in memory.\n");
         initramfs_unpack((uint32_t)mod->start, (uint32_t)(mod->end - mod->start));
+
+        /* Резервируем страницы модуля в PMM */
+        uint32_t mod_start = (uint32_t)mod->start & ~(PAGE_SIZE - 1);
+        uint32_t mod_end = ((uint32_t)mod->end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        pmm_reserve_range(mod_start, mod_end);
         break;
     }
 

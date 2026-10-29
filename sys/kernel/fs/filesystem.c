@@ -47,7 +47,7 @@ int fs_create(const char* name) {
 
 int fs_create_type(const char* name, unsigned int type) {
     if (!name || name[0] == 0) return -1;
-    if (type != FS_REGULAR && type != FS_DIRECTORY) return -1;
+    if (type != FS_REGULAR && type != FS_DIRECTORY && type != FS_SYMLINK) return -1;
     for (unsigned l = 0; name[l]; l++) { if (l > 254) return -1; }
     for (int i = 0; i < MAX_FILES; i++) {
         if (!file_table[i].used) {

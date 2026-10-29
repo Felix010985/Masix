@@ -14,17 +14,26 @@
 #include <stdio.h>
 #include <version.h>
 #include <procfs.h>
+#include <task.h>
 #include <drivers/serial.h>
 
 extern fsdriver_t procfs_driver;
 extern fsdriver_t devtmpfs_driver;
 
 mountpoint_t *mountpoints_list = NULL;
-file_t fd_table[32];
+
+/* Таблица до появления первой задачи: vfs_init() открывает stdio
+ * раньше, чем task_init() создаёт task_t. Как только появляется
+ * current_task, всё уходит в его собственную таблицу. */
+static file_t boot_fd_table[MAX_FD];
+
+file_t* vfs_fd_table(void) {
+    return current_task ? current_task->fds : boot_fd_table;
+}
 
 /* --- Реестр символьных устройств --------------------------------- */
 
-#define MAX_DEVICES 8
+#define MAX_DEVICES 16
 static vfs_device_t device_table[MAX_DEVICES];
 static int device_count = 0;
 
@@ -119,11 +128,14 @@ typedef struct {
 static inet_socket_t inet_sockets[INET_SOCKET_COUNT];
 
 static int32_t vfs_allocate_fd(file_type_t type, void *private_data) {
-    for (int i = 3; i < MAX_FD; i++) {
-        if (fd_table[i].type == FT_EMPTY) {
-            fd_table[i].type = type;
-            fd_table[i].offset = 0;
-            fd_table[i].private_data = private_data;
+    /* Как в Linux: берем самый младший свободный дескриптор. Userland
+     * (например, busybox init) рассчитывает, что после close(0) open()
+     * вернет именно 0, поэтому начинаем поиск с нуля. */
+    for (int i = 0; i < MAX_FD; i++) {
+        if (vfs_fd_table()[i].type == FT_EMPTY) {
+            vfs_fd_table()[i].type = type;
+            vfs_fd_table()[i].offset = 0;
+            vfs_fd_table()[i].private_data = private_data;
             return i;
         }
     }
@@ -193,8 +205,8 @@ static int32_t vfs_inet_address(const void *address, uint32_t address_length, ui
 }
 
 static inet_socket_t *vfs_inet_socket_from_fd(int fd) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_INET_SOCKET) return NULL;
-    return (inet_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_INET_SOCKET) return NULL;
+    return (inet_socket_t*)vfs_fd_table()[fd].private_data;
 }
 
 static int32_t vfs_inet_send(inet_socket_t *source, const uint8_t *buffer, uint32_t length, uint32_t address, uint16_t port) {
@@ -246,36 +258,47 @@ void vfs_mount_core(const char *path, fsdriver_t *driver) {
 void vfs_init(void) {
     mountpoints_list = NULL;
     for (int i = 0; i < 32; i++) {
-        fd_table[i].type = FT_EMPTY;
-        fd_table[i].offset = 0;
-        fd_table[i].private_data = NULL;
+        vfs_fd_table()[i].type = FT_EMPTY;
+        vfs_fd_table()[i].offset = 0;
+        vfs_fd_table()[i].private_data = NULL;
     }
 
-    fd_table[0].type = FT_DEVICE;
-    fd_table[1].type = FT_DEVICE;
-    fd_table[2].type = FT_DEVICE;
-    fd_table[0].private_data = &console_node;
-    fd_table[1].private_data = &console_node;
-    fd_table[2].private_data = &console_node;
+    vfs_fd_table()[0].type = FT_DEVICE;
+    vfs_fd_table()[1].type = FT_DEVICE;
+    vfs_fd_table()[2].type = FT_DEVICE;
+    vfs_fd_table()[0].private_data = &console_node;
+    vfs_fd_table()[1].private_data = &console_node;
+    vfs_fd_table()[2].private_data = &console_node;
 
     // монтирование procfs
     vfs_mount_core("/proc", &procfs_driver);
     vfs_mount_core("/dev", &devtmpfs_driver);
 }
 
+static int32_t vfs_open_internal(const char *path, uint32_t flags, int depth);
+
 int32_t vfs_open(const char *path) {
     if (!path) return -14;
-    return vfs_open_flags(path, 0);
+    return vfs_open_internal(path, 0, 0);
 }
 
 int32_t vfs_open_flags(const char *path, uint32_t flags) {
+    if (!path) return -14;
+    return vfs_open_internal(path, flags, 0);
+}
+
+static int32_t vfs_open_internal(const char *path, uint32_t flags, int depth) {
+    /* Слишком длинная цепочка ссылок - как -ELOOP в Linux. */
+    if (depth > 8) return -40;
+
     int fd = -1;
-    for (int i = 3; i < MAX_FD; i++) {
-        if (fd_table[i].type == FT_EMPTY) { fd = i; break; }
+    for (int i = 0; i < MAX_FD; i++) {
+        if (vfs_fd_table()[i].type == FT_EMPTY) { fd = i; break; }
     }
     if (fd == -1) return -24; // -EMFILE
     vfs_node_t* node = (vfs_node_t*)malloc(sizeof(vfs_node_t));
     if (!node) return -12; // -ENOMEM
+    node->refcount = 1;
     /* Склеиваем путь к файлу с точки монтирования...
      * Освобождаем используемую память после
      * strncmp гарантирует (около 52%) что все пройдет успешно
@@ -298,9 +321,9 @@ int32_t vfs_open_flags(const char *path, uint32_t flags) {
         if (*subpath == '/') subpath++;
         int32_t result = best_mount->driver->open(subpath, node);
         if (result == 0) {
-            fd_table[fd].type = FT_VFS_FILE;
-            fd_table[fd].offset = 0;
-            fd_table[fd].private_data = node;
+            vfs_fd_table()[fd].type = FT_VFS_FILE;
+            vfs_fd_table()[fd].offset = 0;
+            vfs_fd_table()[fd].private_data = node;
             return fd;
         }
 
@@ -327,6 +350,35 @@ int32_t vfs_open_flags(const char *path, uint32_t flags) {
         } // -ENOSPC
     }
 
+    /* Симлинк: вместо самой ссылки открываем её цель. Абсолютная цель
+     * берется как есть, относительная - от каталога ссылки. */
+    if (file_table[file_idx].type == FS_SYMLINK) {
+        const unsigned char* tdata = file_table[file_idx].external_data;
+        uint32_t tsz = file_table[file_idx].size;
+        char target[256];
+        free(node);
+
+        if (!tdata || tsz == 0 || tsz >= sizeof(target)) return -5; // -EIO
+        memcpy(target, tdata, tsz);
+        target[tsz] = '\0';
+
+        if (target[0] == '/') {
+            return vfs_open_internal(target, flags, depth + 1);
+        }
+
+        char full[256];
+        uint32_t len = (uint32_t)strlen(path);
+        uint32_t slash = 0;
+        for (uint32_t i = 0; i < len; i++) {
+            if (path[i] == '/') slash = i;
+        }
+        if (slash + 1 + tsz >= sizeof(full)) return -36; // -ENAMETOOLONG
+        memcpy(full, path, slash);
+        full[slash] = '/';
+        memcpy(full + slash + 1, target, tsz + 1);
+        return vfs_open_internal(full, flags, depth + 1);
+    }
+
     strcpy(node->name, file_table[file_idx].name);
     node->flags = file_table[file_idx].type == FS_DIRECTORY ? VFS_DIRECTORY : VFS_FILE;
     node->size = file_table[file_idx].size;
@@ -334,69 +386,73 @@ int32_t vfs_open_flags(const char *path, uint32_t flags) {
     node->read = node->flags == VFS_FILE ? vfs_ramfs_read : NULL;
     node->write = node->flags == VFS_FILE ? vfs_ramfs_write : NULL;
 
-    fd_table[fd].type = FT_VFS_FILE;
-    fd_table[fd].offset = 0;
-    fd_table[fd].private_data = (void*)node;
+    vfs_fd_table()[fd].type = FT_VFS_FILE;
+    vfs_fd_table()[fd].offset = 0;
+    vfs_fd_table()[fd].private_data = (void*)node;
 
     return fd;
 }
 
 int32_t vfs_read(int fd, void *buf, uint32_t count) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) return -9;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type == FT_EMPTY) return -9;
     if (!buf && count) return -14;
-    if (fd_table[fd].type == FT_DEVICE) {
-        vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
-        return node && node->read ? node->read(node, fd_table[fd].offset, count, (uint8_t*)buf) : -9;
+    if (vfs_fd_table()[fd].type == FT_DEVICE) {
+        vfs_node_t *node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
+        return node && node->read ? node->read(node, vfs_fd_table()[fd].offset, count, (uint8_t*)buf) : -9;
     }
-    if (fd_table[fd].type == FT_PIPE_READ) return vfs_pipe_read((pipe_t*)fd_table[fd].private_data, (uint8_t*)buf, count);
-    if (fd_table[fd].type == FT_UNIX_SOCKET) return vfs_socket_recv(fd, buf, count);
-    if (fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_recv(fd, buf, count);
-    if (fd_table[fd].type != FT_VFS_FILE) return -9;
-    vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
+    if (vfs_fd_table()[fd].type == FT_PIPE_READ) return vfs_pipe_read((pipe_t*)vfs_fd_table()[fd].private_data, (uint8_t*)buf, count);
+    if (vfs_fd_table()[fd].type == FT_UNIX_SOCKET) return vfs_socket_recv(fd, buf, count);
+    if (vfs_fd_table()[fd].type == FT_INET_SOCKET) return vfs_socket_recv(fd, buf, count);
+    if (vfs_fd_table()[fd].type != FT_VFS_FILE) return -9;
+    vfs_node_t *node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
     if (!node || !node->read) return -9;
-    int32_t result = node->read(node, fd_table[fd].offset, count, (uint8_t*)buf);
-    if (result > 0) fd_table[fd].offset += result;
+    int32_t result = node->read(node, vfs_fd_table()[fd].offset, count, (uint8_t*)buf);
+    if (result > 0) vfs_fd_table()[fd].offset += result;
     return result;
 }
 
 int32_t vfs_write(int fd, const void *buf, uint32_t count) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) return -9;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type == FT_EMPTY) return -9;
     if (!buf && count) return -14;
-    if (fd_table[fd].type == FT_DEVICE) {
-        vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
-        return node && node->write ? node->write(node, fd_table[fd].offset, count, (const uint8_t*)buf) : -9;
+    if (vfs_fd_table()[fd].type == FT_DEVICE) {
+        vfs_node_t *node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
+        return node && node->write ? node->write(node, vfs_fd_table()[fd].offset, count, (const uint8_t*)buf) : -9;
     }
-    if (fd_table[fd].type == FT_PIPE_WRITE) return vfs_pipe_write((pipe_t*)fd_table[fd].private_data, (const uint8_t*)buf, count);
-    if (fd_table[fd].type == FT_UNIX_SOCKET) return vfs_socket_send(fd, buf, count);
-    if (fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_send(fd, buf, count);
-    if (fd_table[fd].type != FT_VFS_FILE) return -9;
-    vfs_node_t *node = (vfs_node_t*)fd_table[fd].private_data;
+    if (vfs_fd_table()[fd].type == FT_PIPE_WRITE) return vfs_pipe_write((pipe_t*)vfs_fd_table()[fd].private_data, (const uint8_t*)buf, count);
+    if (vfs_fd_table()[fd].type == FT_UNIX_SOCKET) return vfs_socket_send(fd, buf, count);
+    if (vfs_fd_table()[fd].type == FT_INET_SOCKET) return vfs_socket_send(fd, buf, count);
+    if (vfs_fd_table()[fd].type != FT_VFS_FILE) return -9;
+    vfs_node_t *node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
     if (!node || !node->write) return -9;
-    int32_t result = node->write(node, fd_table[fd].offset, count, (const uint8_t*)buf);
-    if (result > 0) fd_table[fd].offset += result;
+    int32_t result = node->write(node, vfs_fd_table()[fd].offset, count, (const uint8_t*)buf);
+    if (result > 0) vfs_fd_table()[fd].offset += result;
     return result;
 }
 
 int32_t vfs_close(int fd) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) return -9;
-    if (fd_table[fd].type == FT_PIPE_READ || fd_table[fd].type == FT_PIPE_WRITE) {
-        pipe_t *pipe = (pipe_t*)fd_table[fd].private_data;
-        if (fd_table[fd].type == FT_PIPE_READ && pipe->readers > 0) pipe->readers--;
-        if (fd_table[fd].type == FT_PIPE_WRITE && pipe->writers > 0) pipe->writers--;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type == FT_EMPTY) return -9;
+    if (vfs_fd_table()[fd].type == FT_PIPE_READ || vfs_fd_table()[fd].type == FT_PIPE_WRITE) {
+        pipe_t *pipe = (pipe_t*)vfs_fd_table()[fd].private_data;
+        if (vfs_fd_table()[fd].type == FT_PIPE_READ && pipe->readers > 0) pipe->readers--;
+        if (vfs_fd_table()[fd].type == FT_PIPE_WRITE && pipe->writers > 0) pipe->writers--;
         if (pipe->readers == 0 && pipe->writers == 0) pipe->used = 0;
-    } else if (fd_table[fd].type == FT_UNIX_SOCKET) {
-        unix_socket_t *socket = (unix_socket_t*)fd_table[fd].private_data;
+    } else if (vfs_fd_table()[fd].type == FT_UNIX_SOCKET) {
+        unix_socket_t *socket = (unix_socket_t*)vfs_fd_table()[fd].private_data;
         if (socket->peer < UNIX_SOCKET_COUNT) unix_sockets[socket->peer].connected = 0;
         socket->used = 0;
-    } else if (fd_table[fd].type == FT_INET_SOCKET) {
-        inet_socket_t *socket = (inet_socket_t*)fd_table[fd].private_data;
+    } else if (vfs_fd_table()[fd].type == FT_INET_SOCKET) {
+        inet_socket_t *socket = (inet_socket_t*)vfs_fd_table()[fd].private_data;
         socket->used = 0;
-    } else {
-        if (fd_table[fd].private_data) free(fd_table[fd].private_data);
+    } else if (vfs_fd_table()[fd].type == FT_VFS_FILE) {
+        vfs_node_t* node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
+        if (node) {
+            node->refcount--;
+            if (node->refcount == 0) free(node);
+        }
     }
-    fd_table[fd].type = FT_EMPTY;
-    fd_table[fd].offset = 0;
-    fd_table[fd].private_data = NULL;
+    vfs_fd_table()[fd].type = FT_EMPTY;
+    vfs_fd_table()[fd].offset = 0;
+    vfs_fd_table()[fd].private_data = NULL;
     return 0;
 }
 
@@ -417,7 +473,7 @@ int32_t vfs_pipe(int32_t pipefd[2]) {
     read_fd = vfs_allocate_fd(FT_PIPE_READ, pipe);
     if (read_fd < 0) { pipe->used = 0; return read_fd; }
     write_fd = vfs_allocate_fd(FT_PIPE_WRITE, pipe);
-    if (write_fd < 0) { fd_table[read_fd].type = FT_EMPTY; pipe->used = 0; return write_fd; }
+    if (write_fd < 0) { vfs_fd_table()[read_fd].type = FT_EMPTY; pipe->used = 0; return write_fd; }
     pipefd[0] = read_fd;
     pipefd[1] = write_fd;
     return 0;
@@ -474,7 +530,7 @@ int32_t vfs_socket(int domain, int type, int protocol) {
 }
 
 int32_t vfs_socket_bind(int fd, const void *address, uint32_t address_length) {
-    if (fd >= 0 && fd < MAX_FD && fd_table[fd].type == FT_INET_SOCKET) {
+    if (fd >= 0 && fd < MAX_FD && vfs_fd_table()[fd].type == FT_INET_SOCKET) {
         inet_socket_t *socket = vfs_inet_socket_from_fd(fd);
         uint32_t ip;
         uint16_t port;
@@ -488,8 +544,8 @@ int32_t vfs_socket_bind(int fd, const void *address, uint32_t address_length) {
         socket->port = port;
         return 0;
     }
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    unix_socket_t *socket = (unix_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    unix_socket_t *socket = (unix_socket_t*)vfs_fd_table()[fd].private_data;
     char path[UNIX_SOCKET_PATH];
     int32_t result = vfs_socket_address(address, address_length, path);
     if (result < 0) return result;
@@ -500,15 +556,15 @@ int32_t vfs_socket_bind(int fd, const void *address, uint32_t address_length) {
 
 int32_t vfs_socket_listen(int fd, int backlog) {
     (void)backlog;
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    unix_socket_t *socket = (unix_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    unix_socket_t *socket = (unix_socket_t*)vfs_fd_table()[fd].private_data;
     if (!socket->path[0]) return -22;
     socket->listening = 1;
     return 0;
 }
 
 int32_t vfs_socket_connect(int fd, const void *address, uint32_t address_length) {
-    if (fd >= 0 && fd < MAX_FD && fd_table[fd].type == FT_INET_SOCKET) {
+    if (fd >= 0 && fd < MAX_FD && vfs_fd_table()[fd].type == FT_INET_SOCKET) {
         inet_socket_t *socket = vfs_inet_socket_from_fd(fd);
         uint32_t ip;
         uint16_t port;
@@ -520,8 +576,8 @@ int32_t vfs_socket_connect(int fd, const void *address, uint32_t address_length)
         socket->connected = 1;
         return 0;
     }
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    unix_socket_t *client = (unix_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    unix_socket_t *client = (unix_socket_t*)vfs_fd_table()[fd].private_data;
     char path[UNIX_SOCKET_PATH];
     int32_t result = vfs_socket_address(address, address_length, path);
     if (result < 0) return result;
@@ -538,13 +594,13 @@ int32_t vfs_socket_connect(int fd, const void *address, uint32_t address_length)
 }
 
 int32_t vfs_socket_accept(int fd) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    unix_socket_t *server = (unix_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    unix_socket_t *server = (unix_socket_t*)vfs_fd_table()[fd].private_data;
     if (!server->listening || server->pending == UNIX_SOCKET_NONE) return -11;
     int client_fd = server->pending;
     server->pending = UNIX_SOCKET_NONE;
-    if (client_fd < 0 || client_fd >= MAX_FD || fd_table[client_fd].type != FT_UNIX_SOCKET) return -11;
-    unix_socket_t *client = (unix_socket_t*)fd_table[client_fd].private_data;
+    if (client_fd < 0 || client_fd >= MAX_FD || vfs_fd_table()[client_fd].type != FT_UNIX_SOCKET) return -11;
+    unix_socket_t *client = (unix_socket_t*)vfs_fd_table()[client_fd].private_data;
     int client_index = (int)(client - unix_sockets);
     int accepted_index = -1;
     for (int i = 0; i < UNIX_SOCKET_COUNT; i++) if (!unix_sockets[i].used) { accepted_index = i; break; }
@@ -558,25 +614,25 @@ int32_t vfs_socket_accept(int fd) {
 }
 
 int32_t vfs_socket_send(int fd, const void *buffer, uint32_t length) {
-    if (fd >= 0 && fd < MAX_FD && fd_table[fd].type == FT_INET_SOCKET) {
+    if (fd >= 0 && fd < MAX_FD && vfs_fd_table()[fd].type == FT_INET_SOCKET) {
         inet_socket_t *socket = vfs_inet_socket_from_fd(fd);
         if (!socket->connected) return -107;
         return vfs_inet_send(socket, (const uint8_t*)buffer, length, socket->peer_address, socket->peer_port);
     }
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    unix_socket_t *socket = (unix_socket_t*)fd_table[fd].private_data;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    unix_socket_t *socket = (unix_socket_t*)vfs_fd_table()[fd].private_data;
     if (socket->peer >= UNIX_SOCKET_COUNT || !unix_sockets[socket->peer].used) return -107;
     return vfs_socket_queue_write(&unix_sockets[socket->peer], (const uint8_t*)buffer, length);
 }
 
 int32_t vfs_socket_recv(int fd, void *buffer, uint32_t length) {
-    if (fd >= 0 && fd < MAX_FD && fd_table[fd].type == FT_INET_SOCKET) return vfs_socket_recvfrom(fd, buffer, length, NULL, NULL);
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_UNIX_SOCKET) return -9;
-    return vfs_socket_queue_read((unix_socket_t*)fd_table[fd].private_data, (uint8_t*)buffer, length);
+    if (fd >= 0 && fd < MAX_FD && vfs_fd_table()[fd].type == FT_INET_SOCKET) return vfs_socket_recvfrom(fd, buffer, length, NULL, NULL);
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_UNIX_SOCKET) return -9;
+    return vfs_socket_queue_read((unix_socket_t*)vfs_fd_table()[fd].private_data, (uint8_t*)buffer, length);
 }
 
 int32_t vfs_socket_sendto(int fd, const void *buffer, uint32_t length, const void *address, uint32_t address_length) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_INET_SOCKET) return -9;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_INET_SOCKET) return -9;
     inet_socket_t *socket = vfs_inet_socket_from_fd(fd);
     uint32_t ip;
     uint16_t port;
@@ -587,7 +643,7 @@ int32_t vfs_socket_sendto(int fd, const void *buffer, uint32_t length, const voi
 }
 
 int32_t vfs_socket_recvfrom(int fd, void *buffer, uint32_t length, void *address, uint32_t *address_length) {
-    if (fd < 0 || fd >= MAX_FD || fd_table[fd].type != FT_INET_SOCKET) return -9;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type != FT_INET_SOCKET) return -9;
     inet_socket_t *socket = vfs_inet_socket_from_fd(fd);
     if (socket->count == 0) return -11;
     inet_datagram_t *datagram = &socket->datagrams[socket->head];

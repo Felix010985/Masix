@@ -19,6 +19,62 @@
 #include <uapi.h>
 #include <linux/printk.h>
 
+/* fcntl нужен libc и утилитам ровно настолько, чтобы узнать или
+ * выставить флаги дескриптора. Блокировка файлов (F_SETLK и родня)
+ * в Masix не поддерживается - на такие команды отвечаем успехом,
+ * чтобы не ломать редко используемые ветки userland. */
+static int32_t sys_fcntl_impl(int fd, int cmd, long arg) {
+    int32_t ret;
+    if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type == FT_EMPTY) ret = -9; /* -EBADF */
+    else switch (cmd) {
+        case 0:   /* F_DUPFD */
+        case 1030: /* F_DUPFD_CLOEXEC: флаг CLOEXEC мы не храним, но
+                    * дескриптор обязан продублироваться, иначе оболочка
+                    * получает fd 0 и работает не с тем терминалом. */
+            ret = -24; /* -EMFILE */
+            for (int i = (int)arg; i < MAX_FD; i++) {
+                if (vfs_fd_table()[i].type == FT_EMPTY) {
+                    vfs_fd_table()[i] = vfs_fd_table()[fd];
+                    ret = i;
+                    break;
+                }
+            }
+            break;
+        case 1: /* F_GETFD */
+        case 2: /* F_SETFD */
+            ret = 0;
+            break;
+        case 3: /* F_GETFL: считаем все дескрипторы открытыми на чтение-запись */
+            ret = 2; /* O_RDWR */
+            break;
+        case 4: /* F_SETFL */
+        default:
+            ret = 0;
+            break;
+    }
+    return ret;
+}
+
+/* Поля struct new_utsname фиксированной длины: копируем с обрезкой,
+ * чтобы не выйти за 65 байт поля. */
+struct new_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static void uts_copy(char *field, const char *value) {
+    int i = 0;
+    while (value[i] && i < 64) {
+        field[i] = value[i];
+        i++;
+    }
+    field[i] = '\0';
+}
+
 uint32_t syscall_handler_c(struct syscall_regs* regs) {
     {
         char b[16];
@@ -64,6 +120,43 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             }
         }
 
+        /* Новые архитектуры дают сетевые вызовы напрямую, без socketcall.
+         * musl на i386 пробует их первыми, поэтому дублируем маршруты. */
+        case MASIX_SOCKET:
+            return vfs_socket((int)regs->ebx, (int)regs->ecx, (int)regs->edx);
+
+        case MASIX_BIND:
+            return vfs_socket_bind((int)regs->ebx, (const void*)regs->ecx, regs->edx);
+
+        case MASIX_CONNECT:
+            return vfs_socket_connect((int)regs->ebx, (const void*)regs->ecx, regs->edx);
+
+        case MASIX_LISTEN:
+            return vfs_socket_listen((int)regs->ebx, (int)regs->ecx);
+
+        case MASIX_ACCEPT4:
+            return vfs_socket_accept((int)regs->ebx);
+
+        case MASIX_SENDTO:
+            return vfs_socket_sendto((int)regs->ebx, (const void*)regs->ecx, regs->edx,
+                                     (const void*)regs->esi, regs->edi);
+
+        case MASIX_RECVFROM:
+            return vfs_socket_recvfrom((int)regs->ebx, (void*)regs->ecx, regs->edx,
+                                       (void*)regs->esi, (uint32_t*)regs->edi);
+
+        case MASIX_SHUTDOWN:
+            return 0;
+
+        case MASIX_GETSOCKOPT:
+        case MASIX_SETSOCKOPT:
+        case MASIX_GETSOCKNAME:
+        case MASIX_GETPEERNAME:
+        case MASIX_SENDMSG:
+        case MASIX_RECVMSG:
+        case MASIX_SOCKETPAIR:
+            return -LINUX_ENOSYS;
+
         case MASIX_BRK:
             return sys_brk(regs->ebx);
 
@@ -74,7 +167,22 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             return task_fork(regs);
         }
 
+        /* vfork в Masix не разделяет адресное пространство с родителем:
+         * отдаем полноценный fork. Дочерний процесс busybox сразу делает
+         * execve, так что семантически это эквивалентно. */
+        case MASIX_VFORK:
+        {
+            extern int32_t task_fork(struct syscall_regs* regs);
+            return task_fork(regs);
+        }
+
         case MASIX_MODIFY_LDT:
+            return 0;
+
+        /* mprotect: страницы у нас уже отображены; смена прав на лету
+         * не поддерживается, но и не нужна - RELRO из musl просто
+         * получит 0 и продолжит работу. */
+        case MASIX_MPROTECT:
             return 0;
 
         case MASIX_SET_THREAD_AREA:
@@ -96,6 +204,13 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
             extern void gdt_set_entry(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
             gdt_set_entry(entry_number, base_addr, 0xFFFFF, 0xF2, 0xCF);
+
+            /* Запоминаем базу в задаче: переключение контекста восстановит
+             * её в GDT, даже если с тех пор слот занял другой процесс. */
+            if (current_task) {
+                current_task->tls_base = base_addr;
+                current_task->tls_entry = (int)entry_number;
+            }
 
             return 0;
         }
@@ -163,6 +278,46 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         case MASIX_RT_SIGPROCMASK:
             return 0;
 
+        /* Погасить машину ядру нечем, поэтому честно отвечаем -EPERM,
+         * как это делает Linux для непривилегированного вызова. */
+        case MASIX_REBOOT:
+            return -1; /* -EPERM */
+
+        /* Права и владелец файлов в Masix не моделируются. */
+        case MASIX_FCHMOD:
+        case MASIX_FCHOWN32:
+            return 0;
+
+        /* Интервальные таймеры не реализованы: userland получает ноль
+         * и живет без периодических сигналов. */
+        case MASIX_SETITIMER:
+        {
+            /* ebx = which, ecx = new_value, edx = old_value */
+            if (regs->edx) {
+                uint32_t *old = (uint32_t*)regs->edx;
+                old[0] = old[1] = old[2] = old[3] = 0;
+            }
+            return 0;
+        }
+
+        case MASIX_UNAME:
+        {
+            struct new_utsname *name = (struct new_utsname*)regs->ebx;
+            if (!name) return -14; /* -EFAULT */
+            uts_copy(name->sysname, "Linux");
+            uts_copy(name->nodename, "masix");
+            uts_copy(name->release, "5.15.0-masix");
+            uts_copy(name->version, "#1 SMP Masix");
+            uts_copy(name->machine, "i686");
+            uts_copy(name->domainname, "(none)");
+            return 0;
+        }
+
+        /* Сигналов в ядре пока нет: считаем, что ожидание всегда
+         * истекает по таймауту, как это и бывает при пустой очереди. */
+        case MASIX_RT_SIGTIMEDWAIT:
+            return -11; /* -EAGAIN */
+
         case MASIX_EXIT_GROUP:
         {
             debug_puts("Masix: SYS: Process called exit_group. Cleaning up...\n");
@@ -186,7 +341,7 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_FCNTL:
-            return -LINUX_ENOSYS;
+            return sys_fcntl_impl((int)regs->ebx, (int)regs->ecx, (long)regs->edx);
 
         case MASIX_DUP2:
         {
@@ -203,11 +358,20 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             return sys_wait4((int)regs->ebx, (int*)regs->ecx, (int)regs->edx, (void*)regs->esi);
 
         case MASIX_RT_SIGACTION:
-            return -LINUX_ENOSYS;
+            /* Обработчики сигналов не храним: доставки сигналов нет,
+             * но запрос установки/чтения нужно принять без ошибки,
+             * иначе libc/userland считает среду сломанной. */
+            return 0;
 
         case MASIX_TKILL:
         case MASIX_TGKILL:
             return 0; /* Сигналов в ядре пока нет - считаем доставленным */
+
+        /* kill() с той же оговоркой: сигналы не доставляются, но вызов
+         * не должен валить оболочку, которая опрашивает готовность
+         * переднего плана через kill(-pgrp, SIGTTIN). */
+        case MASIX_KILL:
+            return 0;
 
         case MASIX_MMAP2:
             return sys_mmap2(regs->ebx, regs->ecx, regs->edx, regs->esi, (int)regs->edi, regs->ebp);
@@ -229,6 +393,8 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
         }
 
         case MASIX_FCNTL64:
+            return sys_fcntl_impl((int)regs->ebx, (int)regs->ecx, (long)regs->edx);
+
         case MASIX_PRLIMIT64:
         case MASIX_STATX:
         case MASIX_PSELECT6:
@@ -247,10 +413,29 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             return sys_fstatat(-100 /* AT_FDCWD */, (const char*)regs->ebx,
                                (struct kstat*)regs->ecx, 0);
 
-        case MASIX_FSTAT64:
-            return sys_fstat64(regs->ebx, (struct kstat*)regs->ecx);
+        /* lstat64: как stat64, но не разыменовывая саму ссылку. Полноценно
+         * симлинки не различаем, однако ls без этого вызова падает с
+         * -ENOSYS и не может перечислить каталог. */
+        case MASIX_LSTAT64:
+            return sys_fstatat(-100 /* AT_FDCWD */, (const char*)regs->ebx,
+                               (struct kstat*)regs->ecx, AT_SYMLINK_NOFOLLOW);
 
-        case MASIX_FSTAT64_ALT:
+        case MASIX_READLINK:
+            return sys_readlink((const char*)regs->ebx, (char*)regs->ecx, regs->edx);
+
+        /* readlinkat: dirfd пока игнорируем, путь разрешается от cwd
+         * либо как абсолютный. */
+        case MASIX_READLINKAT:
+            return sys_readlink((const char*)regs->ecx, (char*)regs->edx, regs->esi);
+
+        case MASIX_ACCESS:
+            return sys_access((const char*)regs->ebx, (int)regs->ecx);
+
+        /* faccessat: dirfd игнорируем, как и в readlinkat. */
+        case MASIX_FACCESSAT:
+            return sys_access((const char*)regs->ecx, (int)regs->edx);
+
+        case MASIX_FSTAT64:
             return sys_fstat64(regs->ebx, (struct kstat*)regs->ecx);
 
         case MASIX_FSTATAT64:
@@ -308,7 +493,27 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
 
         case MASIX_GETPGID:
             // ebx = pid. Если ebx == 0, возвращаем PGID текущего процесса.
-            return 1;
+            // Группы процессов в Masix не различаются, поэтому у каждого
+            // процесса его собственная группа, совпадающая с PID.
+            return (regs->ebx == 0 || (int)regs->ebx == (int)current_task->pid)
+                       ? (int)current_task->pid : (int)regs->ebx;
+
+        /* Сессии и группы процессов в Masix пока не моделируются: для
+         * пользователя достаточно, что вызовы не мешают работе. init
+         * (PID 1) - лидер сессии, потомки получают собственные группы. */
+        case MASIX_SETSID:
+            return (int)current_task->pid;
+
+        case MASIX_SETPGID:
+            return 0;
+
+        case MASIX_GETSID:
+            /* getpgid/getsid(0) для init и его потомков */
+            return (regs->ebx == 0 || (int)regs->ebx == (int)current_task->pid)
+                       ? (int)current_task->pid : (int)regs->ebx;
+
+        case MASIX_GETTID:
+            return (int)current_task->pid;
 
         case MASIX_MUNMAP:
         {
@@ -329,27 +534,27 @@ uint32_t syscall_handler_c(struct syscall_regs* regs) {
             uint64_t* res_ptr = (uint64_t*)regs->esi;
             uint32_t whence = regs->edi;
 
-            if (fd < 0 || fd >= MAX_FD || fd_table[fd].type == FT_EMPTY) {
+            if (fd < 0 || fd >= MAX_FD || vfs_fd_table()[fd].type == FT_EMPTY) {
                 return -9; // -EBADF
             }
 
-            vfs_node_t* node = (vfs_node_t*)fd_table[fd].private_data;
+            vfs_node_t* node = (vfs_node_t*)vfs_fd_table()[fd].private_data;
             uint64_t offset = ((uint64_t)offset_high << 32) | offset_low;
 
-            if (!node || fd_table[fd].type != FT_VFS_FILE) return -29; // -ESPIPE
+            if (!node || vfs_fd_table()[fd].type != FT_VFS_FILE) return -29; // -ESPIPE
 
             if (whence == 0) {         // SEEK_SET
-                fd_table[fd].offset = (uint32_t)offset;
+                vfs_fd_table()[fd].offset = (uint32_t)offset;
             } else if (whence == 1) {  // SEEK_CUR
-                fd_table[fd].offset += (uint32_t)offset;
+                vfs_fd_table()[fd].offset += (uint32_t)offset;
             } else if (whence == 2) {  // SEEK_END
-                fd_table[fd].offset = node->size + (uint32_t)offset;
+                vfs_fd_table()[fd].offset = node->size + (uint32_t)offset;
             } else {
                 return -22; // -EINVAL
             }
 
             if (res_ptr != NULL) {
-                *res_ptr = (uint64_t)fd_table[fd].offset;
+                *res_ptr = (uint64_t)vfs_fd_table()[fd].offset;
             }
 
             return 0;

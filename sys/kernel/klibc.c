@@ -15,7 +15,6 @@
 #include <stddef.h>
 
 extern void tty_write_char(char c);
-extern char keyboard_getc(void);
 unsigned int strlen(const char* s);
 
 #ifndef NULL
@@ -191,28 +190,6 @@ void print_num(int n) {
     itoa(n, buf, 10);
     print_str(buf);
 }
-
-// я найду и убью того кто это блять сделал ебень тупой блять
-// static void internal_kernel_read_line(char* buf, int max_len) {
-//     int read_bytes = 0;
-//     while (read_bytes < max_len - 1) {
-//         char c = keyboard_getc();
-//         if (c == '\n' || c == '\r') {
-//             buf[read_bytes++] = '\n';
-//             tty_write_char('\n');
-//             break;
-//         } else if (c == '\b') {
-//             if (read_bytes > 0) {
-//                 read_bytes--;
-//                 tty_write_char('\b');
-//             }
-//         } else {
-//             buf[read_bytes++] = c;
-//             tty_write_char(c);
-//         }
-//     }
-//     buf[read_bytes] = '\0';
-// }
 
 void vprintf(const char* fmt, ...) {
     va_list args;
