@@ -213,5 +213,6 @@ Initramfs собирается только из статических bootstra
 
 ---
 
-См. также [`CONTRIBUTING.md`](CONTRIBUTING.md) - как контрибьютить, и
-[`AGENTS.md`](AGENTS.md) - заметки для агентов и правила работы с кодом.
+См. также [`CONTRIBUTING.md`](CONTRIBUTING.md) - как контрибьютить,
+[`PEOPLE.md`](PEOPLE.md) - правила работы с кодом и отладка, и
+[`AGENTS.md`](AGENTS.md) - указания для автоматизированных агентов.

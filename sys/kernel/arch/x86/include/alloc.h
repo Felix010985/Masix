@@ -9,6 +9,7 @@
  */
 #pragma once
 #include <stddef.h>
+#define HEAP_SIZE 0x100000
 void* alloc(size_t size);
 void alloc_free(void* ptr);
 void* malloc(size_t size);

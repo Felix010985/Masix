@@ -9,8 +9,8 @@
  */
 #include <stddef.h>
 #include <stdint.h>
+#include <alloc.h>
 
-#define HEAP_SIZE 0x100000
 static uint8_t heap[HEAP_SIZE];
 
 /* Каждому выделенному блоку памяти предшествует этот заголовок */
@@ -106,6 +106,8 @@ void alloc_free(void* ptr) {
 
     alloc_irq_restore(flags);
 }
+
+/* Удобные функции снизу */
 
 void* malloc(size_t size) {
     return alloc(size);

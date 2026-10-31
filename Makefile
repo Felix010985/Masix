@@ -99,7 +99,7 @@ $(BUILD_DIR)/masix.iso: $(KERNEL_ELF) $(KERNEL_BZ) $(INITRAMFS_IMG) $(GRUB_DIR)/
 	$(GRUB) -o $@ $(ISO_DIR) 2>/dev/null
 	printf "$(STATUS_OK) ISO успешно собран: $(CLR_GREEN)$@$(CLR_RESET)\n"
 
-# Физический образ ядра: тот самый, что грузят загрузчики по адресу 1 МБ.
+# Файл ядра в формате ELF, поддерживается GRUB, Limine и другими
 $(KERNEL_BIN): $(KERNEL_ELF)
 	printf "$(STATUS_INFO) Извлечение физического образа ядра\n"
 	$(OBJCOPY) -O binary $< $@

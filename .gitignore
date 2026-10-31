@@ -30,3 +30,6 @@ build/
 # Сгенерировано tools/configure
 config.mk
 sys/kernel/include/build_config.h
+
+
+CONTRIBUTING.md

@@ -9,6 +9,7 @@
  */
 #include <vfs.h>
 #include <string.h>
+#include <config.h>
 
 enum {
     DEV_NULL,
@@ -58,10 +59,10 @@ static int32_t devtmpfs_random_read(vfs_node_t *node, uint32_t offset, uint32_t 
 
 static int32_t devtmpfs_com1_write(vfs_node_t *node, uint32_t offset, uint32_t size, const uint8_t *buffer) {
     (void)node; (void)offset;
-    extern void serial_puts(const char* s);
+    /* Fix: serial_puts убран и заменен на debug_puts по канонам масекса */
     for (uint32_t i = 0; i < size; i++) {
         char tmp[2] = { (char)buffer[i], 0 };
-        serial_puts(tmp);
+        debug_puts(tmp);
     }
     return size;
 }
